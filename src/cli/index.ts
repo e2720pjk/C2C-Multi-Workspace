@@ -7,6 +7,7 @@ import { startBridge } from "../bridge/server.js";
 import { findBridgeObservation, findLiveBridge, type RuntimeState } from "../bridge/runtime.js";
 import { adminFetch, ensureBridge, stopBridge } from "../process/daemon.js";
 import { Workspace } from "../workspace/manager.js";
+import { INSTALLATION_WORKSPACE_ID, WorkspaceRegistry } from "../workspace/registry.js";
 import { AuthStore } from "../auth/store.js";
 import { detectTunnelBinaries } from "../tunnel/detect.js";
 import {
@@ -21,7 +22,7 @@ import {
   NAMED_LOGIN_PROMPT,
   NAMED_REPAIR_MESSAGE,
   needsTunnelChoice,
-  readTunnelState,
+  readInstallationTunnelState,
   TUNNEL_CHOICE_PROMPT,
 } from "../tunnel/state.js";
 import { Logger } from "../logger/index.js";
@@ -67,6 +68,12 @@ const cross = (msg: string): void => say(`✗ ${msg}`);
 
 function resolveWorkspace(option?: string): string {
   return path.resolve(option ?? process.cwd());
+}
+
+const INSTALLATION_ENDPOINT_ID = INSTALLATION_WORKSPACE_ID;
+
+function previousInstallationEndpoint(workspaceId: string): LastEndpoint | null {
+  return readLastEndpoint(INSTALLATION_ENDPOINT_ID) ?? readLastEndpoint(workspaceId);
 }
 
 function parseInteger(value: string): number {
@@ -137,7 +144,7 @@ function persistWorkspaceEndpoint(opts: {
 }
 
 function tunnelChoicePayload(workspace: Workspace, zoneHint?: string): Record<string, unknown> {
-  const state = readTunnelState(workspace.id);
+  const state = readInstallationTunnelState(workspace.id);
   const zone = parseZoneInput(zoneHint ?? "") ?? state.zone ?? null;
   return {
     ok: true,
@@ -147,7 +154,7 @@ function tunnelChoicePayload(workspace: Workspace, zoneHint?: string): Record<st
     namedReady: isNamedTunnelReady(state),
     zone,
     hostname: state.hostname ?? null,
-    suggestedHostname: zone ? suggestedNamedHostname(zone, workspace.name, workspace.id) : null,
+    suggestedHostname: zone ? suggestedNamedHostname(zone, PRODUCT_NAME, INSTALLATION_ENDPOINT_ID) : null,
     userPrompt: needsTunnelChoice(state) ? TUNNEL_CHOICE_PROMPT : undefined,
     loginPrompt: NAMED_LOGIN_PROMPT,
     fallbackReason: state.fallbackReason,
@@ -178,8 +185,11 @@ interface PairingResponse {
 
 interface AdminInfo {
   workspaceId: string;
+  workspaceIds?: string[];
+  defaultWorkspaceId?: string | null;
   workspaceName: string;
   workspaceRoot: string;
+  workspaces?: Array<Record<string, unknown>>;
   port: number;
   publicUrl: string | null;
   tunnel: { running: boolean; url: string | null; provider: string };
@@ -192,8 +202,9 @@ interface AdminInfo {
 async function ensureBridgeAndTunnel(
   workspaceRoot: string,
   opts: { tunnel: boolean }
-): Promise<{ runtime: RuntimeState; info: AdminInfo; mcpUrl: string | null }> {
-  const { runtime } = await ensureBridge(workspaceRoot);
+): Promise<{ runtime: RuntimeState; info: AdminInfo; mcpUrl: string | null; workspace: Workspace }> {
+  const targetWorkspace = new Workspace(workspaceRoot);
+  const { runtime } = await ensureBridge(targetWorkspace.root);
   let info = await adminFetch<AdminInfo>(runtime, "GET", "/admin/info");
   let mcpUrl: string | null = info.publicUrl ? `${info.publicUrl}/mcp` : null;
   if (opts.tunnel && !info.publicUrl) {
@@ -208,7 +219,7 @@ async function ensureBridgeAndTunnel(
     info = await adminFetch<AdminInfo>(runtime, "GET", "/admin/info");
     mcpUrl = `${result.url}/mcp`;
   }
-  return { runtime, info, mcpUrl };
+  return { runtime, info, mcpUrl, workspace: targetWorkspace };
 }
 
 program
@@ -248,28 +259,29 @@ program
 
 program
   .command("start")
-  .description("Start (or reuse) the bridge for this workspace")
+  .description("Start (or reuse) the installation bridge and register this workspace")
   .option("-w, --workspace <path>", "workspace root (defaults to current directory)")
   .option("--tunnel", "also establish the secure public connection", false)
   .option("--json", "machine-readable output", false)
   .action(async (opts: { workspace?: string; tunnel: boolean; json: boolean }) => {
     const root = resolveWorkspace(opts.workspace);
     try {
-      const { runtime, info, mcpUrl } = await ensureBridgeAndTunnel(root, { tunnel: opts.tunnel });
+      const { runtime, info, mcpUrl, workspace: targetWorkspace } = await ensureBridgeAndTunnel(root, { tunnel: opts.tunnel });
       const connectorName = mcpUrl
         ? persistWorkspaceEndpoint({
-            workspaceId: info.workspaceId,
-            workspaceName: info.workspaceName,
+            workspaceId: INSTALLATION_ENDPOINT_ID,
+            workspaceName: PRODUCT_NAME,
             port: runtime.port,
             publicUrl: info.publicUrl,
             mcpUrl,
+            previous: previousInstallationEndpoint(info.workspaceId),
           })
-        : readLastEndpoint(info.workspaceId)?.connectorName;
+        : previousInstallationEndpoint(info.workspaceId)?.connectorName;
       if (opts.json) {
-        say(JSON.stringify({ ok: true, port: runtime.port, workspaceId: info.workspaceId, mcpUrl, connectorName }));
+        say(JSON.stringify({ ok: true, port: runtime.port, workspaceId: targetWorkspace.id, workspaceName: targetWorkspace.name, mcpUrl, connectorName }));
         return;
       }
-      check(`当前项目已识别（${info.workspaceName}）`);
+      check(`当前项目已识别（${targetWorkspace.name}）`);
       check("Workspace Bridge 已启动");
       if (mcpUrl) check("安全连接已建立");
     } catch (error) {
@@ -281,7 +293,7 @@ program
 
 program
   .command("setup")
-  .description("First-time setup: bridge + secure connection + pairing code")
+  .description("First-time setup: installation bridge + secure connection + pairing code")
   .option("-w, --workspace <path>")
   .option("--no-tunnel", "local-only setup (development)")
   .option("--json", "machine-readable output", false)
@@ -295,29 +307,30 @@ program
         say("");
       }
       const sandbox = trySandboxAllow();
-      const { runtime, info, mcpUrl } = await ensureBridgeAndTunnel(root, { tunnel: opts.tunnel });
+      const { runtime, info, mcpUrl, workspace: targetWorkspace } = await ensureBridgeAndTunnel(root, { tunnel: opts.tunnel });
       const connectorName = mcpUrl
         ? persistWorkspaceEndpoint({
-            workspaceId: info.workspaceId,
-            workspaceName: info.workspaceName,
+            workspaceId: INSTALLATION_ENDPOINT_ID,
+            workspaceName: PRODUCT_NAME,
             port: runtime.port,
             publicUrl: info.publicUrl,
             mcpUrl,
+            previous: previousInstallationEndpoint(info.workspaceId),
           })
         : connectorNameFor({
-            workspaceName: info.workspaceName,
-            workspaceId: info.workspaceId,
-            previousName: readLastEndpoint(info.workspaceId)?.connectorName,
-            hadEndpointBefore: Boolean(readLastEndpoint(info.workspaceId)),
+            workspaceName: PRODUCT_NAME,
+            workspaceId: INSTALLATION_ENDPOINT_ID,
+            previousName: previousInstallationEndpoint(info.workspaceId)?.connectorName,
+            hadEndpointBefore: Boolean(previousInstallationEndpoint(info.workspaceId)),
           });
       const pairingResult = await adminFetch<PairingResponse>(runtime, "POST", "/admin/pairing");
-      const tunnelState = readTunnelState(info.workspaceId);
+      const tunnelState = readInstallationTunnelState(targetWorkspace.id);
       if (opts.json) {
         say(
           JSON.stringify({
             ok: true,
-            workspaceId: info.workspaceId,
-            workspaceName: info.workspaceName,
+            workspaceId: targetWorkspace.id,
+            workspaceName: targetWorkspace.name,
             connectorName,
             mcpUrl: mcpUrl ?? `http://127.0.0.1:${runtime.port}/mcp`,
             local: mcpUrl === null,
@@ -333,7 +346,7 @@ program
         );
         return;
       }
-      check(`当前项目已识别（${info.workspaceName}）`);
+      check(`当前项目已识别（${targetWorkspace.name}）`);
       check("Workspace Bridge 已启动");
       if (mcpUrl) check("安全连接已建立");
       say("");
@@ -351,7 +364,7 @@ program
 
 program
   .command("stop")
-  .description("Stop the bridge for this workspace")
+  .description("Stop the installation bridge")
   .option("-w, --workspace <path>")
   .action(async (opts: { workspace?: string }) => {
     const stopped = await stopBridge(resolveWorkspace(opts.workspace));
@@ -361,7 +374,7 @@ program
 
 program
   .command("restart")
-  .description("Restart the bridge for this workspace")
+  .description("Restart the installation bridge")
   .option("-w, --workspace <path>")
   .option("--tunnel", "re-establish the secure public connection", false)
   .action(async (opts: { workspace?: string; tunnel: boolean }) => {
@@ -369,8 +382,8 @@ program
     await stopBridge(root);
     await new Promise((resolve) => setTimeout(resolve, 500));
     try {
-      const { info, mcpUrl } = await ensureBridgeAndTunnel(root, { tunnel: opts.tunnel });
-      check(`Bridge 已重启（${info.workspaceName}）`);
+      const { mcpUrl, workspace: targetWorkspace } = await ensureBridgeAndTunnel(root, { tunnel: opts.tunnel });
+      check(`Bridge 已重启（${targetWorkspace.name}）`);
       if (mcpUrl) check(`安全连接已建立`);
     } catch (error) {
       handleCliError(error, false);
@@ -381,7 +394,7 @@ program
 
 program
   .command("status")
-  .description("Show bridge status for this workspace")
+  .description("Show installation bridge status")
   .option("-w, --workspace <path>")
   .option("--json", "machine-readable output", false)
   .action(async (opts: { workspace?: string; json: boolean }) => {
@@ -499,19 +512,19 @@ program
       }
     }
 
-    // Tunnel + remote reachability. If this workspace once had a public URL,
-    // a full quit reclaims it — restore a tunnel and tell the Skill to update
-    // the existing ChatGPT connector (never treat that as "local mode").
-    const lastEndpoint = workspace ? readLastEndpoint(workspace.id) : null;
+    // Tunnel + remote reachability. If the installation once had a public URL,
+    // a full quit reclaims it — restore one tunnel and tell the Skill to update
+    // the installation Connector (never treat that as "local mode").
+    const lastEndpoint = workspace ? previousInstallationEndpoint(workspace.id) : null;
     const connectorName = workspace
       ? connectorNameFor({
-          workspaceName: workspace.name,
-          workspaceId: workspace.id,
+          workspaceName: PRODUCT_NAME,
+          workspaceId: INSTALLATION_ENDPOINT_ID,
           previousName: lastEndpoint?.connectorName,
           hadEndpointBefore: Boolean(lastEndpoint),
         })
-      : "Codex with ChatGPT";
-    const tunnelState = workspace ? readTunnelState(workspace.id) : null;
+      : PRODUCT_NAME;
+    const tunnelState = workspace ? readInstallationTunnelState(workspace.id) : null;
     const namedReady = tunnelState ? isNamedTunnelReady(tunnelState) : false;
     let namedRepair: { needed: boolean; userMessage?: string } = { needed: false };
     let chatgptRepair: {
@@ -595,8 +608,8 @@ program
         const action = connectorAction(lastEndpoint?.mcpUrl, nextMcp);
         const boundName = nextMcp
           ? persistWorkspaceEndpoint({
-              workspaceId: info.workspaceId,
-              workspaceName: info.workspaceName,
+              workspaceId: INSTALLATION_ENDPOINT_ID,
+              workspaceName: PRODUCT_NAME,
               port: runtime.port,
               publicUrl: currentUrl,
               mcpUrl: nextMcp,
@@ -704,7 +717,7 @@ program
 
 program
   .command("pair")
-  .description("Generate a fresh pairing code")
+  .description("Generate a fresh installation pairing code")
   .option("-w, --workspace <path>")
   .option("--json", "machine-readable output", false)
   .action(async (opts: { workspace?: string; json: boolean }) => {
@@ -723,7 +736,7 @@ program
 
 program
   .command("unpair")
-  .description("Revoke ChatGPT's access to this workspace immediately")
+  .description("Revoke ChatGPT's access to this installation immediately")
   .option("-w, --workspace <path>")
   .action(async (opts: { workspace?: string }) => {
     const root = resolveWorkspace(opts.workspace);
@@ -732,8 +745,8 @@ program
     if (runtime) {
       await adminFetch(runtime, "POST", "/admin/revoke-all");
     } else {
-      // bridge not running: revoke directly in the persisted store
-      new AuthStore(workspace.id).revokeAll();
+      // bridge not running: revoke the installation-wide persisted store
+      new AuthStore(INSTALLATION_ENDPOINT_ID).revokeAll();
     }
     check("已断开 ChatGPT 对当前项目的访问（所有令牌已吊销）");
   });
@@ -763,22 +776,108 @@ program
     if (!shown) say("暂无日志。");
   });
 
-program
+const workspaceCmd = program
   .command("workspace")
-  .description("Show workspace identity and project info")
+  .description("Manage registered workspaces or show the current workspace")
   .option("-w, --workspace <path>")
   .option("--json", "machine-readable output", false)
   .action((opts: { workspace?: string; json: boolean }) => {
-    const workspace = new Workspace(resolveWorkspace(opts.workspace));
-    const project = workspace.detectProject();
-    const data = { workspaceId: workspace.id, name: workspace.name, root: workspace.root, ...project };
-    if (opts.json) say(JSON.stringify(data));
-    else {
-      say(`Workspace：${data.name}（${data.workspaceId}）`);
-      say(`类型：${data.projectType}  语言：${data.languages.join(", ") || "-"}`);
-      say(`路径：${data.root}`);
+    try {
+      const workspace = new Workspace(resolveWorkspace(opts.workspace));
+      const project = workspace.detectProject();
+      const data = { workspaceId: workspace.id, name: workspace.name, root: workspace.root, ...project };
+      if (opts.json) say(JSON.stringify(data));
+      else {
+        say(`Workspace：${data.name}（${data.workspaceId}）`);
+        say(`类型：${data.projectType}  语言：${data.languages.join(", ") || "-"}`);
+        say(`路径：${data.root}`);
+      }
+    } catch (error) {
+      handleCliError(error, opts.json);
     }
   });
+
+function emitWorkspaceList(registry: WorkspaceRegistry, json: boolean): void {
+  const workspaces = registry.summaries();
+  if (json) {
+    say(JSON.stringify({ ok: true, defaultWorkspaceId: registry.defaultWorkspaceId(), workspaces }));
+    return;
+  }
+  if (workspaces.length === 0) {
+    say("尚未注册 workspace。使用 `c2c workspace add --workspace <path>` 添加。");
+    return;
+  }
+  for (const item of workspaces) {
+    const state = !item.enabled ? "disabled" : item.available ? "available" : "unavailable";
+    say(`${item.isDefault ? "*" : " "} ${item.alias} (${item.workspaceId}) — ${state}${item.branch ? ` — ${item.branch}` : ""}`);
+  }
+}
+
+workspaceCmd
+  .command("list")
+  .description("List registered workspaces without exposing local roots")
+  .option("--json", "machine-readable output", false)
+  .action((opts: { json: boolean }, command) => {
+    const json = opts.json || Boolean((command.parent?.opts() as { json?: boolean } | undefined)?.json);
+    try {
+      emitWorkspaceList(new WorkspaceRegistry(), json);
+    } catch (error) {
+      handleCliError(error, json);
+    }
+  });
+
+for (const commandName of ["add", "register"]) {
+  workspaceCmd
+    .command(commandName)
+    .description("Register a workspace for this C2C installation")
+    .option("-w, --workspace <path>", "workspace root")
+    .option("--alias <alias>", "human-readable workspace alias")
+    .option("--json", "machine-readable output", false)
+    .action((opts: { workspace?: string; alias?: string; json: boolean }, command) => {
+      const parentOpts = command.parent?.opts() as { workspace?: string; json?: boolean } | undefined;
+      const workspacePath = opts.workspace ?? parentOpts?.workspace;
+      const json = opts.json || Boolean(parentOpts?.json);
+      try {
+        if (!workspacePath) throw new Error("workspace root is required");
+        const record = new WorkspaceRegistry().register(resolveWorkspace(workspacePath), { alias: opts.alias });
+        if (json) say(JSON.stringify({ ok: true, workspaceId: record.workspaceId, alias: record.alias }));
+        else check(`已加入 workspace：${record.alias}（${record.workspaceId}）`);
+      } catch (error) {
+        handleCliError(error, json);
+      }
+    });
+}
+
+function workspaceMutationCommand(
+  name: "enable" | "disable" | "remove" | "set-default",
+  description: string,
+  mutate: (registry: WorkspaceRegistry, selector: string) => unknown
+): void {
+  workspaceCmd
+    .command(name)
+    .description(description)
+    .argument("<workspace>", "workspace id or alias")
+    .option("--json", "machine-readable output", false)
+    .action((selector: string, opts: { json: boolean }, command) => {
+      const json = opts.json || Boolean((command.parent?.opts() as { json?: boolean } | undefined)?.json);
+      try {
+        const result = mutate(new WorkspaceRegistry(), selector);
+        const safeWorkspace =
+          result && typeof result === "object"
+            ? Object.fromEntries(Object.entries(result).filter(([key]) => key !== "root"))
+            : result;
+        if (json) say(JSON.stringify({ ok: true, workspace: safeWorkspace }));
+        else check(`${name}：${selector}`);
+      } catch (error) {
+        handleCliError(error, json);
+      }
+    });
+}
+
+workspaceMutationCommand("enable", "Enable a registered workspace", (registry, selector) => registry.setEnabled(selector, true));
+workspaceMutationCommand("disable", "Disable a registered workspace", (registry, selector) => registry.setEnabled(selector, false));
+workspaceMutationCommand("remove", "Remove a workspace from this installation", (registry, selector) => registry.remove(selector));
+workspaceMutationCommand("set-default", "Choose the default workspace", (registry, selector) => registry.setDefault(selector));
 
 // ---------------------------------------------------------------- sandbox-allow (Codex writable_roots, macOS + Windows)
 
@@ -1118,7 +1217,7 @@ program
     }
   );
 
-const tunnelCmd = program.command("tunnel").description("Choose or inspect the public connection for this workspace");
+const tunnelCmd = program.command("tunnel").description("Choose or inspect the installation's public connection");
 
 tunnelCmd
   .command("status", { isDefault: true })
@@ -1148,16 +1247,16 @@ tunnelCmd
   .requiredOption("--mode <mode>", "quick or named")
   .option("-w, --workspace <path>")
   .option("--zone <domain>", "Cloudflare domain for a named hostname")
-  .option("--hostname <hostname>", "override the default c2c-<project>.<zone>")
+  .option("--hostname <hostname>", "override the default installation hostname")
   .option("--json", "machine-readable output", false)
   .action(async (opts: { mode: string; workspace?: string; zone?: string; hostname?: string; json: boolean }) => {
     const root = resolveWorkspace(opts.workspace);
     try {
       const workspace = new Workspace(root);
       const mode = opts.mode.trim().toLowerCase();
-      const previous = readTunnelState(workspace.id);
+      const previous = readInstallationTunnelState(workspace.id);
       if (mode === "quick") {
-        const state = chooseQuickTunnel(workspace.id);
+        const state = chooseQuickTunnel(INSTALLATION_ENDPOINT_ID);
         if (await findLiveBridge(workspace.id)) {
           if (previous.preference === "named") await stopBridge(root);
         }
@@ -1186,8 +1285,8 @@ tunnelCmd
       }
       if (!opts.json) say(NAMED_LOGIN_PROMPT);
       const result = await provisionNamedTunnel({
-        workspaceId: workspace.id,
-        workspaceName: workspace.name,
+        workspaceId: INSTALLATION_ENDPOINT_ID,
+        workspaceName: PRODUCT_NAME,
         zone,
         hostname: opts.hostname,
       });

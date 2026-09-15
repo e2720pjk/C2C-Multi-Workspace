@@ -29,6 +29,13 @@ export function readTunnelState(workspaceId: string): TunnelState {
   );
 }
 
+/** Installation tunnel state wins; old per-workspace state is a migration fallback. */
+export function readInstallationTunnelState(defaultWorkspaceId?: string): TunnelState {
+  const installation = readTunnelState("installation");
+  if (installation.preference !== "unset" || installation.askedAt) return installation;
+  return defaultWorkspaceId ? readTunnelState(defaultWorkspaceId) : installation;
+}
+
 export function writeTunnelState(state: TunnelState): TunnelState {
   writeSecureJson(tunnelStateFile(state.workspaceId), state);
   return state;

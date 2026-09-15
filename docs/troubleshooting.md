@@ -22,10 +22,10 @@ again. The local process may still be running.
 ### Everything was quit and ChatGPT can no longer connect
 Quitting Codex / the terminal stops the public address. The next `c2c doctor`
 starts a new address and sets `chatgptRepair.needed`. The Skill should tell the
-user that the old address expired, then **Delete** THIS workspace's
+user that the old address expired, then **Delete** the installation
 connector (`chatgptRepair.connectorName`) and create it again with the new
-address (never click Reconnect — the old URL is dead). Other workspaces keep
-their own connectors so two projects can stay connected at once.
+address (never click Reconnect — the old URL is dead). Registered workspaces
+reuse this one connector and can stay available at the same time.
 
 Mint the pairing code only when the ChatGPT Authorize form is on screen
 (`c2c pair`). After the connector is recreated, doctor being green is not
@@ -41,7 +41,7 @@ Fixed ChatGPT pages for first-time setup and later repair (do not hunt the UI):
   https://chatgpt.com/plugins#settings/Connectors?create-connector=true&redirectAfter=%2Fplugins
 
 ### Tunnel URL unreachable / ChatGPT says the connector is broken
-Same as above: `c2c doctor`, then Delete + recreate THIS workspace's
+Same as above: `c2c doctor`, then Delete + recreate the installation
 connector if `chatgptRepair.needed`. Mint a pairing code with `c2c pair` only
 when the Authorize form is on screen.
 If this workspace uses a stable hostname, doctor sets `namedRepair` instead —
@@ -72,9 +72,9 @@ Leave it unset to keep cloudflared's default.
 
 ### ChatGPT gets 401 on every tool call
 The access token expired and refresh failed (e.g. after `c2c unpair` or a
-long offline period). Delete THIS workspace's connector if the address also
-changed; otherwise run Authorize again in ChatGPT and enter a fresh pairing
-code. Never use Reconnect when the public address has been replaced.
+long offline period). Delete the installation connector if the address also changed; otherwise run
+Authorize again in ChatGPT and enter a fresh pairing code. Never use Reconnect
+when the public address has been replaced.
 
 ### cloudflared is not installed
 macOS: `brew install cloudflared`
@@ -96,9 +96,9 @@ there, so each new chat looks like a health-check failure.
 do not need elevation.
 
 ### Port already in use
-Handled automatically: an existing healthy bridge for the same workspace is
-reused; anything else makes the bridge pick a free port. Configuration follows
-automatically.
+Handled automatically: an existing healthy installation bridge serving the
+registered workspace is reused; adding another registered root does not start
+another bridge or tunnel. Anything else makes the bridge pick a free port.
 
 ### Reading a file returns ACCESS_DENIED_SENSITIVE_FILE
 Working as intended: `.env`, keys, credentials and anything matched by
@@ -113,7 +113,8 @@ collection page is open (`https://chatgpt.com/g/g-p-…/project`).
 ### This workspace opened the wrong ChatGPT Project
 Do not pick another project by name automatically. Open the collection that
 matches this workspace and tell Codex「已找到」, or say you want the old
-long-chat instead. Each workspace has its own Project and its own connector.
+long-chat instead. Each workspace may have its own Project/conversation, but all registered
+workspaces use the installation connector.
 
 ### Completely stuck
 ```

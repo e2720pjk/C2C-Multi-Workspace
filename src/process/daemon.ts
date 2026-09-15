@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import { ensureDir, getStateDir } from "../config/paths.js";
 import { findBridgeObservation, findLiveBridge, probeBridge, readRuntimeState, type RuntimeState } from "../bridge/runtime.js";
 import { Workspace } from "../workspace/manager.js";
+import { WorkspaceRegistry } from "../workspace/registry.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -31,6 +32,9 @@ export interface EnsureBridgeResult {
  */
 export async function ensureBridge(workspaceRoot: string, opts: { port?: number } = {}): Promise<EnsureBridgeResult> {
   const workspace = new Workspace(workspaceRoot);
+  // Register before probing: a live installation can acquire another target
+  // without restarting, and its request router reloads this allowlist.
+  new WorkspaceRegistry().register(workspace.root);
   const observation = await findBridgeObservation(workspace.id);
   if (observation.state === "healthy") return { runtime: observation.runtime, spawned: false };
   if (observation.state === "unknown") {
@@ -104,7 +108,7 @@ export async function stopBridge(workspaceRoot: string): Promise<boolean> {
   const runtime = readRuntimeState(workspace.id);
   if (!runtime) return false;
   const healthy = await probeBridge(runtime.port);
-  if (healthy && healthy.workspaceId === workspace.id) {
+  if (healthy && (healthy.workspaceIds?.includes(workspace.id) || healthy.workspaceId === workspace.id)) {
     try {
       await adminFetch(runtime, "POST", "/admin/shutdown", 5000);
       return true;

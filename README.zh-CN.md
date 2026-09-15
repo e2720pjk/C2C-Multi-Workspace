@@ -76,6 +76,23 @@ Ready.
 
 凭证放在系统目录，不进项目。
 
+### 多 workspace
+
+一个安装只有一个 MCP endpoint 和一个 ChatGPT 连接器。加入新的项目不需要重建
+连接器，也不会因工具切换 workspace 而重启隧道：
+
+```bash
+c2c workspace add --workspace /path/to/main --alias main
+c2c workspace add --workspace /path/to/gemini-refactor --alias gemini-refactor
+c2c workspace list --json
+c2c workspace set-default main
+```
+
+ChatGPT 先调用 `list_workspaces`，再给 `read_file`、`git_status` 等工具传入
+`workspace: "main"` 或返回的 `workspaceId`。不填写时使用持久化的默认值；未知、
+停用、移除或别名歧义会直接失败，不会悄悄回退到默认值。详见
+[多 workspace 文档](docs/multi-workspace.md)。
+
 ## 工作原理
 
 ```
@@ -93,21 +110,20 @@ Ready.
              │  OAuth + 配对       │   Cloudflare Quick Tunnel
              │  Tunnel 管理        │
              └──────────┬──────────┘
-                        │  只读
+                        │  按请求路由，只读
                         ▼
              ┌─────────────────────┐          ┌─────────────────────┐
-             │     本地工作区      │◀─────────│    Codex Harness    │
-             └─────────────────────┘ 编辑/git │  Shell / 测试 / 修复 │
+             │   已注册 workspace  │◀─────────│    Codex Harness    │
+             │     A · B · C       │ 编辑/git │  Shell / 测试 / 修复 │
                                               └─────────────────────┘
 ```
 
 - **控制面（Computer Use）**：Codex 与 ChatGPT 之间只交换极小的结构化 `[C2C]`
   状态消息——`INIT → PLAN → EXECUTED → REVIEW → DONE`。绝不粘贴 diff、日志
   或文件内容。
-- **数据面（MCP）**：ChatGPT 缺什么自己拉什么，共 9 个只读工具：
-  `workspace_info`、`list_directory`、`read_file`、`search_workspace`、
-  `git_status`、`git_diff`、`test_status`、`execution_summary`、
-  `execution_output`。
+- **数据面（MCP）**：ChatGPT 缺什么自己拉什么。`list_workspaces` 用来发现已注册
+  workspace；所有依赖 workspace 的工具都接受 workspace ID/别名，不填时使用
+  稳定的默认 workspace。
 - **独立审查**：Codex 执行完毕后，ChatGPT 通过 MCP 亲自检查真实的 git diff
   和测试记录——绝不因为 Codex 说"测试全过"就直接相信。
 
@@ -115,12 +131,14 @@ Ready.
 
 - **从构造上只读**：服务端根本不存在写文件/删除/Shell/提交类工具，任何提示
   注入都无法启用它们。
-- **一个工作区 = 一道边界**：每个令牌绑定单一工作区；路径校验基于规范化
-  realpath（symlink、`../`、绝对路径逃逸全部被拦截并有测试覆盖）。
+- **已注册 workspace 才是边界**：一个安装级 endpoint 只服务明确注册的 workspace
+  集合。每次请求按 ID/别名（或稳定默认值）路由；规范化 realpath 会拦截 symlink、
+  `../` 和绝对路径逃逸，未知、停用、歧义目标直接失败。
 - **敏感文件永不外泄**：`.env*`、密钥、SSH、各类凭据默认拒绝
   （`.env.example` 放行）；`.c2cignore` 可追加自定义规则。
 - **知道 URL 不等于有权限**：公网 MCP 端点强制 OAuth 2.1（PKCE S256、动态
-  客户端注册、refresh token 轮换）。无令牌：401；令牌属于别的工作区：403。
+  客户端注册、refresh token 轮换）。令牌只授权安装级 endpoint，不能增加未注册的
+  filesystem root。
 - **模型永远接触不到长期凭据**：唯一会出现在浏览器里的秘密是一次性配对码
   （5 分钟有效、限 5 次尝试、限速、用后即毁）。
 
@@ -136,25 +154,26 @@ pnpm test           # vitest：150 个测试（路径安全、OAuth、配对、M
 c2c setup           # 一条命令：Bridge + 隧道 + 配对码
 c2c sandbox-allow   # 把本地设置目录加入 Codex 沙箱白名单（macOS / Windows）
 c2c status / doctor / pair / unpair / logs / stop
+c2c workspace add/list/set-default/enable/disable/remove
 ```
 
 环境要求：Node.js >= 20、git；公网连接需要 `cloudflared`
 （自动检测，Skill 会替你安装）。如果 QUIC 被拦截，设置
 `C2C_TUNNEL_PROTOCOL=http2` 后重启 Bridge。
 
-文档：[架构](docs/architecture.md) · [协议](docs/protocol.md) ·
-[安全](docs/security.md) · [故障排查](docs/troubleshooting.md)
+文档：[多 workspace](docs/multi-workspace.md) · [架构](docs/architecture.md) ·
+[协议](docs/protocol.md) · [安全](docs/security.md) · [故障排查](docs/troubleshooting.md)
 
 ## 目录结构
 
 ```
 src/
   bridge/     本机回环 HTTP 服务、端口自动恢复、管理 API
-  mcp/        9 个只读工具、无状态 Streamable HTTP
+  mcp/        workspace-aware 只读工具、无状态 Streamable HTTP
   auth/       OAuth 2.1（PKCE、动态注册、refresh 轮换、吊销）
   pairing/    一次性配对码（CSPRNG、TTL、限速）
-  workspace/  路径收敛、敏感文件策略、搜索、git
-  tunnel/     TunnelProvider 抽象 + Cloudflare Quick Tunnel
+  workspace/  workspace 注册表、路径收敛、敏感文件策略、搜索、git
+  tunnel/     安装级 TunnelProvider 抽象 + Cloudflare Quick/Named Tunnel
   execution/  审查闭环所需的执行记录
   process/    守护进程生命周期
   cli/        c2c 命令行

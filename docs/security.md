@@ -2,9 +2,11 @@
 
 ## Trust boundaries
 
-1. **Workspace root** is the smallest authorization boundary. One bridge serves
-   exactly one workspace; every token is bound to `workspace_id`; a token for
-   project A returns 403 on project B's bridge.
+1. **Registered workspace root** is the smallest read authorization boundary.
+   One installation bridge serves an explicit registry; every workspace-dependent
+   request resolves one enabled id/alias (or the persisted default). OAuth
+   authorizes the installation endpoint, while the registry prevents a request
+   for A from reading B or an unregistered root.
 2. **Workspace content is untrusted.** README, comments, diffs may contain
    prompt injection. Every MCP tool description carries an explicit warning and
    tools never grant capabilities based on file content.
@@ -16,7 +18,7 @@
 
 | Threat | Mitigation |
 | --- | --- |
-| MCP URL leaks | URL alone is useless: every `/mcp` request requires a valid bearer token (401 without, 403 wrong workspace) |
+| MCP URL leaks | URL alone is useless: every `/mcp` request requires a valid bearer token (401 without); tokens authorize the installation endpoint and cannot add roots to the registry |
 | Pairing code brute force | 8 chars from a 31-char CSPRNG alphabet (~40 bits), 5 attempts per session, per-IP rate limit (10/min), 5-minute TTL, one-time use, session destroyed on limit |
 | OAuth CSRF | `state` round-tripped verbatim; authorization requests are server-side records keyed by random ids |
 | Code interception | PKCE S256 mandatory (plain rejected); authorization codes are one-time, 5-minute TTL, bound to client + redirect URI |
@@ -25,7 +27,7 @@
 | Symlink escape | Canonicalization resolves symlinks before the containment check (file and directory symlinks both covered by tests) |
 | Sensitive files | Deny-by-default patterns (.env*, keys, SSH, cloud creds, keychains…) enforced at resolve time — reads, listings, and search all pass through the same gate; `git diff` adds pathspec excludes; `.env.example` allowed |
 | Oversized file / diff DoS | read_file caps lines and bytes per response; git_diff paginates by byte offset with hard caps; search caps matches and file sizes |
-| Tunnel exposure | Bridge binds 127.0.0.1 only (refuses 0.0.0.0); the only public surface is HTTPS via the tunnel, protected by OAuth; `/health` reveals only a salted workspace hash |
+| Tunnel exposure | Bridge binds 127.0.0.1 only (refuses 0.0.0.0); the only public surface is HTTPS via the one installation tunnel, protected by OAuth; `/health` reveals ids/health only |
 | Admin API abuse | Loopback-only + random admin token (0600 runtime file) + requests with proxy headers (`cf-connecting-ip`, `x-forwarded-for`) rejected; unauthenticated probes get 404 |
 | Log credential leakage | Logger redacts token prefixes, bearer headers, token-like parameters, and pairing-code-shaped strings before writing |
 | Execution output leak | Codex may nominate test/build/lint logs; a local sanitizer redacts tokens, pairing-code-shaped strings and home paths, truncates size, and refuses private-key blocks entirely. Restricted items are listed without a body. ChatGPT still cannot run commands. |
@@ -35,15 +37,18 @@
 
 Scopes: `workspace.read`, `workspace.search`, `git.read`, `execution.read`,
 `offline_access`. Tools enforce scopes individually (`INSUFFICIENT_SCOPE`).
-Access tokens: 1 hour. Refresh tokens: 30 days, rotated. All tokens bound to
-`workspace_id` and `client_id`.
+Access tokens: 1 hour. Refresh tokens: 30 days, rotated. Multi-workspace
+installation tokens are bound to the installation and `client_id`; the selected
+workspace is still required to be in the registered, enabled allowlist. Legacy
+single-workspace token files remain readable for compatibility.
 
 ## Storage
 
 State lives under the OS-convention app dir
 (`~/Library/Application Support/codex-with-chatgpt` on macOS), directories 0700,
-files 0600. Named-hostname preference and tunnel metadata live there too
-(`tunnels/<workspaceId>.json`) — never in the project. Only SHA-256 hashes of
+files 0600. The registered workspace collection/default, installation OAuth,
+runtime, endpoint, and tunnel metadata live there — never in a project. Legacy
+per-workspace tunnel/auth files are migration inputs. Only SHA-256 hashes of
 tokens are persisted — a stolen state file does not yield usable bearer tokens.
 
 **V1 limitation**: client registrations and token hashes are file-based rather

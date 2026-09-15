@@ -5,7 +5,8 @@ import type { Logger } from "../logger/index.js";
 
 export interface BearerAuthDeps {
   store: AuthStore;
-  workspaceId: string;
+  /** Legacy single-workspace audience check. Omit for installation tokens. */
+  workspaceId?: string;
   getBaseUrl: (req: Request) => string;
   logger: Logger;
 }
@@ -13,7 +14,8 @@ export interface BearerAuthDeps {
 /**
  * Bearer-token guard for /mcp.
  * - missing/invalid/expired token  -> 401 (+ WWW-Authenticate with resource metadata)
- * - valid token for another workspace -> 403
+ * - valid token for another legacy workspace -> 403
+ * Installation-wide tokens omit the workspace audience check.
  */
 export function bearerAuth(deps: BearerAuthDeps) {
   return (req: Request, res: Response, next: NextFunction): void => {
@@ -39,7 +41,7 @@ export function bearerAuth(deps: BearerAuthDeps) {
         .json({ error: "unauthorized", error_description: `Token ${verdict.reason}` });
       return;
     }
-    if (verdict.record.workspaceId !== deps.workspaceId) {
+    if (deps.workspaceId !== undefined && verdict.record.workspaceId !== deps.workspaceId) {
       deps.logger.warn("Rejected MCP request: token bound to a different workspace");
       res.status(403).json({
         error: "forbidden",

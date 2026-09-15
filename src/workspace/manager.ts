@@ -100,6 +100,8 @@ export class Workspace {
       throw new WorkspaceError("NOT_A_DIRECTORY", `Workspace root is not a directory: ${rootInput}`);
     }
     this.root = real;
+    // Identity is tied to the canonical worktree root, not repository name or
+    // branch, so sibling worktrees remain independent routing targets.
     this.id = createHash("sha256").update(normCase(real)).digest("hex").slice(0, 12);
     this.ignoreRules = new IgnoreRules(real);
     this.projectConfig = parseProjectConfig(readJsonIfExists<unknown>(path.join(real, ".c2c.json")));

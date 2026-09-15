@@ -130,8 +130,9 @@ style until you ask to switch.
 ### Optional stable hostname
 
 The default public address is a temporary Cloudflare URL. It changes when the
-bridge restarts, and Codex repairs ChatGPT by deleting that workspace's
-connector and adding it again.
+bridge restarts, and Codex repairs the installation connector by deleting it
+and adding it again. Adding or selecting another workspace does not create a
+connector or restart the tunnel.
 
 If you have a Cloudflare account and a domain already on Cloudflare, first-time
 setup (and the next coding session, once) will ask whether you want a stable
@@ -141,6 +142,24 @@ across restarts. If you skip it, or the login fails, Codex stays on the temporar
 address — same features, just a slower repair.
 
 Credentials stay in the OS app state directory, not in the project.
+
+### Multiple workspaces
+
+One installation has one MCP endpoint and one ChatGPT connector. Register
+additional roots without restarting that connector or tunnel:
+
+```bash
+c2c workspace add --workspace /path/to/main --alias main
+c2c workspace add --workspace /path/to/gemini-refactor --alias gemini-refactor
+c2c workspace list --json
+c2c workspace set-default main
+```
+
+ChatGPT can call `list_workspaces`, then pass `workspace: "main"` or the
+returned `workspaceId` to `read_file`, `git_status`, and the other
+workspace-dependent tools. An omitted selector uses the persisted default;
+unknown, disabled, removed, or ambiguous selectors fail instead of falling
+back. See [multi-workspace](docs/multi-workspace.md).
 
 ## How it works
 
@@ -159,21 +178,21 @@ Credentials stay in the OS app state directory, not in the project.
              │  OAuth + Pairing    │   Cloudflare Quick Tunnel
              │  Tunnel Manager     │
              └──────────┬──────────┘
-                        │  read-only
+                        │  request-scoped, read-only
                         ▼
              ┌─────────────────────┐          ┌─────────────────────┐
-             │   Local Workspace   │◀─────────│    Codex Harness    │
-             └─────────────────────┘ edit/git │ shell / tests / fix │
+             │ Registered Workspaces│◀────────│    Codex Harness    │
+             │    A · B · C        │ edit/git │ shell / tests / fix │
                                               └─────────────────────┘
 ```
 
 - **Control plane (Computer Use)**: Codex and ChatGPT exchange tiny structured
   `[C2C]` state messages — `INIT → PLAN → EXECUTED → REVIEW → DONE`. No diffs,
   no logs, no file bodies are ever pasted.
-- **Data plane (MCP)**: ChatGPT pulls what it needs itself through 9 read-only
-  tools: `workspace_info`, `list_directory`, `read_file`, `search_workspace`,
-  `git_status`, `git_diff`, `test_status`, `execution_summary`,
-  `execution_output`.
+- **Data plane (MCP)**: ChatGPT pulls what it needs itself through the
+  read-only tools. `list_workspaces` discovers the registered targets; every
+  workspace-dependent tool accepts an optional workspace id/alias and otherwise
+  uses the stable default.
 - **Independent review**: after Codex executes, ChatGPT inspects the actual
   git diff and test records through MCP — it never trusts "all tests passed"
   claims blindly.
@@ -182,14 +201,15 @@ Credentials stay in the OS app state directory, not in the project.
 
 - **Read-only by construction**: write/delete/shell/commit tools simply do not
   exist on the server. No prompt injection can enable them.
-- **One workspace = one boundary**: every token is bound to a single workspace;
-  path containment uses canonical realpaths (symlink/`../`/absolute-path escapes
-  are all blocked and tested).
+- **Registered workspaces are the boundary**: one installation endpoint serves
+  only its explicit workspace registry. Each request is routed by id/alias (or
+  the stable default); canonical realpaths block symlink/`../`/absolute-path
+  escapes and unknown/disabled/ambiguous targets fail closed.
 - **Sensitive files never leave**: `.env*`, keys, SSH, credentials are denied by
   default (`.env.example` allowed); `.c2cignore` adds your own rules.
 - **Knowing the URL grants nothing**: the public MCP endpoint requires OAuth 2.1
-  (PKCE S256, dynamic client registration, rotating refresh tokens). Without a
-  token: 401. Wrong workspace: 403.
+  (PKCE S256, dynamic client registration, rotating refresh tokens). Tokens
+  authorize the installation, never an unregistered filesystem root.
 - **The model never sees long-lived credentials**: the only secret that ever
   touches a browser is a one-time pairing code (5-minute TTL, 5 attempts,
   rate-limited, destroyed on use).
@@ -206,24 +226,25 @@ pnpm test           # vitest: 150 tests (path security, OAuth, pairing, MCP e2e)
 c2c setup           # bridge + tunnel + pairing code, all in one
 c2c sandbox-allow   # whitelist the settings dir in Codex (macOS + Windows)
 c2c status / doctor / pair / unpair / logs / stop
+c2c workspace add/list/set-default/enable/disable/remove
 ```
 
 Requirements: Node.js >= 20, git. `cloudflared` for the public connection
 (auto-detected; the Skill installs it for you). If QUIC is blocked, set
 `C2C_TUNNEL_PROTOCOL=http2` and restart the bridge.
 
-Docs: [architecture](docs/architecture.md) · [protocol](docs/protocol.md) ·
-[security](docs/security.md) · [troubleshooting](docs/troubleshooting.md)
+Docs: [multi-workspace](docs/multi-workspace.md) · [architecture](docs/architecture.md) ·
+[protocol](docs/protocol.md) · [security](docs/security.md) · [troubleshooting](docs/troubleshooting.md)
 
 ## Project layout
 
 ```
 src/
   bridge/     loopback HTTP server, port recovery, admin API
-  mcp/        9 read-only tools, stateless Streamable HTTP
+  mcp/        workspace-aware read-only tools, stateless Streamable HTTP
   auth/       OAuth 2.1 (PKCE, DCR, refresh rotation, revocation)
   pairing/    one-time pairing codes (CSPRNG, TTL, rate limits)
-  workspace/  path containment, sensitive-file policy, search, git
+  workspace/  registry, path containment, sensitive-file policy, search, git
   tunnel/     TunnelProvider abstraction + Cloudflare Quick/Named Tunnel
   execution/  execution records for the review loop
   process/    daemon lifecycle
