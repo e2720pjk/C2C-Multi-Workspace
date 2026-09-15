@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { spawn, type ChildProcess } from "node:child_process";
 import { OpenAiSecureTunnel } from "../src/tunnel/openai-secure.js";
+import { AuthStore } from "../src/auth/store.js";
 import { findBinary } from "../src/tunnel/detect.js";
 import { cleanup, makeTmpDir } from "./helpers.js";
 
@@ -74,8 +75,14 @@ describe("OpenAI Secure Tunnel integration", () => {
     dirs.push(stateDir);
     const children = [fakeChild(), fakeChild()];
     const headers: string[] = [];
+    const authStore = new AuthStore("installation", { file: path.join(stateDir, "auth.json") });
+    const issuedTokens: string[] = [];
     let starts = 0;
-    let authorizations = 0;
+    let maxActiveChildren = 0;
+    let activeChildren = 0;
+    let replaced = 0;
+    let resolveReplaced!: () => void;
+    const replacedPromise = new Promise<void>((resolve) => { resolveReplaced = resolve; });
     const tunnel = new OpenAiSecureTunnel({
       stateDir,
       tunnelId: "tunnel_0123456789abcdef0123456789abcdef",
@@ -86,15 +93,80 @@ describe("OpenAI Secure Tunnel integration", () => {
         expect(args.join(" ")).toContain("--mcp.extra-headers Authorization: env:C2C_MCP_AUTHORIZATION");
         const file = args[args.indexOf("--health.url-file") + 1];
         fs.writeFileSync(file, "http://127.0.0.1:39999\\n", { mode: 0o600 });
-        return children[starts++];
+        const child = children[starts++];
+        if (starts === 2) expect(authStore.verifyAccessToken(issuedTokens[0]).ok).toBe(true);
+        activeChildren++;
+        maxActiveChildren = Math.max(maxActiveChildren, activeChildren);
+        child.once("exit", () => activeChildren--);
+        expect(activeChildren).toBe(1);
+        return child;
       },
-      mcpAuthorization: () => ({ value: `Bearer local-${++authorizations}`, expiresAt: Date.now() + 100 }),
+      mcpAuthorization: () => {
+        const ttl = issuedTokens.length === 0 ? 1_000 : 60_000;
+        const issued = authStore.issueTokens({
+          clientId: "c2c-openai-tunnel",
+          scopes: ["workspace.read"],
+          accessTtlMs: ttl,
+        });
+        issuedTokens.push(issued.accessToken);
+        return { value: `Bearer ${issued.accessToken}`, expiresAt: Date.now() + ttl };
+      },
+      onAuthorizationReplaced: () => {
+        replaced++;
+        authStore.revokeToken(issuedTokens[0]);
+        resolveReplaced();
+      },
       readyProbe: async () => true,
     });
     await tunnel.start(48765);
-    for (let i = 0; i < 30 && starts < 2; i++) await new Promise((resolve) => setTimeout(resolve, 25));
+    await replacedPromise;
     expect(starts).toBe(2);
-    expect(headers).toEqual(["Bearer local-1", "Bearer local-2"]);
+    expect(headers).toHaveLength(2);
+    expect(headers[0]).not.toBe(headers[1]);
+    expect(replaced).toBe(1);
+    expect(authStore.verifyAccessToken(issuedTokens[0]).ok).toBe(false);
+    expect(authStore.verifyAccessToken(issuedTokens[1]).ok).toBe(true);
+    expect(maxActiveChildren).toBe(1);
+    expect(tunnel.status().authorizationHealthy).toBe(true);
+    await tunnel.stop();
+  });
+
+  it("fails closed when a replacement client never becomes ready", async () => {
+    const stateDir = makeTmpDir("openai-tunnel-auth-failure");
+    dirs.push(stateDir);
+    const child = fakeChild();
+    let starts = 0;
+    let activeChildren = 0;
+    let maxActiveChildren = 0;
+    let invalidated = 0;
+    const tunnel = new OpenAiSecureTunnel({
+      stateDir,
+      tunnelId: "tunnel_0123456789abcdef0123456789abcdef",
+      apiKey: "runtime-secret",
+      startTimeoutMs: 100,
+      binaryResolver: () => "/tmp/tunnel-client",
+      spawnProcess: (_binary, args) => {
+        starts++;
+        if (starts > 1) throw new Error("replacement client failed to spawn");
+        const file = args[args.indexOf("--health.url-file") + 1];
+        fs.writeFileSync(file, "http://127.0.0.1:39999\\n", { mode: 0o600 });
+        activeChildren++;
+        maxActiveChildren = Math.max(maxActiveChildren, activeChildren);
+        child.once("exit", () => activeChildren--);
+        return child;
+      },
+      mcpAuthorization: () => ({ value: `Bearer local-${Date.now()}`, expiresAt: Date.now() + 80 }),
+      onAuthorizationInvalidated: () => { invalidated++; },
+      readyProbe: async () => true,
+    });
+    await tunnel.start(48765);
+    for (let i = 0; i < 30 && tunnel.status().running; i++) await new Promise((resolve) => setTimeout(resolve, 25));
+    expect(starts).toBeGreaterThanOrEqual(2);
+    expect(tunnel.status().running).toBe(false);
+    expect(tunnel.status().authorizationHealthy).toBe(false);
+    expect(tunnel.status().detail).toMatch(/authorization|spawn/i);
+    expect(invalidated).toBeGreaterThan(0);
+    expect(maxActiveChildren).toBe(1);
     await tunnel.stop();
   });
 

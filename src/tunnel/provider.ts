@@ -8,6 +8,10 @@ export interface TunnelStatus {
   url: string | null;
   provider: string;
   detail?: string;
+  /** False when the provider process is alive but its local MCP authorization is unusable. */
+  authorizationHealthy?: boolean;
+  /** Expiry of the current internal authorization; never the token itself. */
+  authorizationExpiresAt?: number;
 }
 
 export interface TunnelDoctorReport {

@@ -39,7 +39,8 @@ function tunnelForInstallation(
   _defaultWorkspaceId: string,
   logger: Logger,
   mcpAuthorization?: () => TunnelAuthorization | Promise<TunnelAuthorization>,
-  onAuthorizationInvalidated?: () => void,
+  onAuthorizationInvalidated?: () => void | Promise<void>,
+  onAuthorizationReplaced?: () => void | Promise<void>,
   usePersistedState = true
 ): TunnelProvider {
   // Non-persisted embedded bridges are isolated test/consumer instances; they
@@ -54,6 +55,7 @@ function tunnelForInstallation(
       tunnelId: state.tunnelId || process.env.CONTROL_PLANE_TUNNEL_ID?.trim(),
       mcpAuthorization,
       onAuthorizationInvalidated,
+      onAuthorizationReplaced,
     });
   }
   const binding = namedTunnelBinding(state);
@@ -169,12 +171,13 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
   });
   const tunnelTokenTtlMs = Math.max(1_000, opts.accessTokenTtlMs ?? 5 * 60 * 1_000);
   let tunnelAuthorization: { raw: string; value: string; expiresAt: number } | null = null;
+  const retiredTunnelAuthorizations: string[] = [];
   const getTunnelAuthorization = (): TunnelAuthorization => {
     const refreshAt = Date.now() + 30_000;
     if (tunnelAuthorization && tunnelAuthorization.expiresAt > refreshAt) {
       return { value: tunnelAuthorization.value, expiresAt: tunnelAuthorization.expiresAt };
     }
-    if (tunnelAuthorization) authStore.revokeToken(tunnelAuthorization.raw);
+    if (tunnelAuthorization) retiredTunnelAuthorizations.push(tunnelAuthorization.raw);
     const issued = authStore.issueTokens({
       clientId: "c2c-openai-tunnel",
       scopes: [...SUPPORTED_SCOPES].filter((scope) => scope !== "offline_access"),
@@ -187,14 +190,28 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
     };
     return { value: tunnelAuthorization.value, expiresAt: tunnelAuthorization.expiresAt };
   };
+  const retireTunnelAuthorizations = (): void => {
+    for (const raw of retiredTunnelAuthorizations) authStore.revokeToken(raw);
+    retiredTunnelAuthorizations.length = 0;
+  };
   const clearTunnelAuthorization = (): void => {
     if (tunnelAuthorization) authStore.revokeToken(tunnelAuthorization.raw);
+    for (const raw of retiredTunnelAuthorizations) authStore.revokeToken(raw);
+    retiredTunnelAuthorizations.length = 0;
     tunnelAuthorization = null;
   };
   const pairing = new PairingManager(INSTALLATION_WORKSPACE_ID, { ttlMs: opts.pairingTtlMs });
   // One provider belongs to the bridge/installation, never to a tool call.
   const tunnel =
-    opts.tunnelProvider ?? tunnelForInstallation(workspace.id, logger, getTunnelAuthorization, clearTunnelAuthorization, ownsInstallation);
+    opts.tunnelProvider ??
+    tunnelForInstallation(
+      workspace.id,
+      logger,
+      getTunnelAuthorization,
+      clearTunnelAuthorization,
+      retireTunnelAuthorizations,
+      ownsInstallation
+    );
   const adminToken = `c2c_admin_${randomBytes(24).toString("base64url")}`;
 
   let publicBaseUrl: string | null = null;
@@ -337,7 +354,8 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
     void withTunnelOperation(async () => {
       if (closed) throw new Error("Bridge is shutting down.");
       const status = tunnel.status();
-      const url = status.running ? (status.url ?? tunnel.getPublicUrl()) : await tunnel.start(port);
+      const usable = status.running && status.authorizationHealthy !== false;
+      const url = usable ? (status.url ?? tunnel.getPublicUrl()) : await tunnel.start(port);
       publicBaseUrl = url;
       persistRuntime();
       return url;

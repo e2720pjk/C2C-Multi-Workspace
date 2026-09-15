@@ -196,7 +196,7 @@ function readCappedUtf8(filePath: string, maxBytes: number): string {
 }
 
 function mcpUrlForTunnel(info: Pick<AdminInfo, "publicUrl" | "tunnel">): string | null {
-  if (!info.publicUrl) return null;
+  if (!info.publicUrl || (info.tunnel.provider === "openai-secure" && info.tunnel.authorizationHealthy === false)) return null;
   return info.tunnel.provider === "openai-secure" ? info.publicUrl : `${info.publicUrl}/mcp`;
 }
 
@@ -287,7 +287,14 @@ interface AdminInfo {
   workspaces?: Array<Record<string, unknown>>;
   port: number;
   publicUrl: string | null;
-  tunnel: { running: boolean; url: string | null; provider: string; detail?: string };
+  tunnel: {
+    running: boolean;
+    url: string | null;
+    provider: string;
+    detail?: string;
+    authorizationHealthy?: boolean;
+    authorizationExpiresAt?: number;
+  };
   tokenCount: number;
   pairingActive: boolean;
   pid: number;
@@ -302,7 +309,7 @@ async function ensureBridgeAndTunnel(
   const { runtime } = await ensureBridge(targetWorkspace.root);
   let info = await adminFetch<AdminInfo>(runtime, "GET", "/admin/info");
   let mcpUrl: string | null = mcpUrlForTunnel(info);
-  if (opts.tunnel && !info.tunnel.running) {
+  if (opts.tunnel && (!info.tunnel.running || info.tunnel.authorizationHealthy === false)) {
     const selection = selectTunnelProvider(readInstallationTunnelState());
     if (selection.diagnostic) throw new Error(selection.diagnostic);
     const binaries = detectTunnelBinaries();
@@ -318,6 +325,13 @@ async function ensureBridgeAndTunnel(
     await adminFetch<TunnelStartResponse>(runtime, "POST", "/admin/tunnel/start", 90_000);
     info = await adminFetch<AdminInfo>(runtime, "GET", "/admin/info");
     mcpUrl = mcpUrlForTunnel(info);
+  }
+  if (
+    opts.tunnel &&
+    info.tunnel.provider === "openai-secure" &&
+    (!info.tunnel.running || info.tunnel.authorizationHealthy === false)
+  ) {
+    throw new Error(info.tunnel.detail ?? "OPENAI_MCP_AUTHORIZATION_UNHEALTHY: tunnel authorization is not usable.");
   }
   return { runtime, info, mcpUrl, workspace: targetWorkspace };
 }
@@ -424,7 +438,8 @@ program
             previousName: previousInstallationEndpoint(info.workspaceId)?.connectorName,
             hadEndpointBefore: Boolean(previousInstallationEndpoint(info.workspaceId)),
           });
-      const pairingResult = await adminFetch<PairingResponse>(runtime, "POST", "/admin/pairing");
+      const openAiTunnel = info.tunnel.provider === "openai-secure" && info.tunnel.running && info.tunnel.authorizationHealthy !== false;
+      const pairingResult = openAiTunnel ? null : await adminFetch<PairingResponse>(runtime, "POST", "/admin/pairing");
       const tunnelState = readInstallationTunnelState();
       if (opts.json) {
         say(
@@ -434,15 +449,17 @@ program
             workspaceName: targetWorkspace.name,
             connectorName,
             mcpUrl,
-            local: mcpUrl === null && info.tunnel.provider !== "openai-secure",
-            pairingCode: pairingResult.code,
-            pairingExpiresAt: pairingResult.expiresAt,
+            local: mcpUrl === null,
+            connectorAuthentication: openAiTunnel ? "none" : "oauth-pairing",
+            pairingCode: pairingResult?.code,
+            pairingExpiresAt: pairingResult?.expiresAt,
             sandbox,
             tunnel: {
               provider: info.tunnel.provider,
               mode: info.tunnel.provider === "openai-secure" ? "openai" : isNamedTunnelReady(tunnelState) ? "named" : "quick",
               hostname: tunnelState.hostname ?? null,
               running: info.tunnel.running,
+              authorizationHealthy: info.tunnel.authorizationHealthy,
               fallback: Boolean(tunnelState.fallbackReason),
             },
           })
@@ -451,16 +468,19 @@ program
       }
       check(`当前项目已识别（${targetWorkspace.name}）`);
       check("Workspace Bridge 已启动");
-      if (mcpUrl) check("安全连接已建立");
-      else if (info.tunnel.provider === "openai-secure" && info.tunnel.running) check("OpenAI Secure Tunnel 已连接");
+      if (openAiTunnel) check("OpenAI Secure Tunnel 已连接");
+      else if (mcpUrl) check("安全连接已建立");
       say("");
       if (mcpUrl) say(`连接地址：${mcpUrl}`);
-      else if (info.tunnel.provider === "openai-secure") say("连接方式：OpenAI Secure Tunnel（使用已配置的 Tunnel ID）");
       else say(`本地地址：http://127.0.0.1:${runtime.port}/mcp`);
-      say(`配对码：${pairingResult.code}（${Math.round((pairingResult.expiresAt - Date.now()) / 60000)} 分钟内有效）`);
-      say("");
-      say("下一步：在 ChatGPT 的连接器设置中添加以上地址（OAuth），并在授权页输入配对码。");
-      say("如果你在使用 Codex Skill，这一步会自动完成。");
+      if (openAiTunnel) {
+        say("Connector authentication: No authentication");
+      } else {
+        say(`配对码：${pairingResult!.code}（${Math.round((pairingResult!.expiresAt - Date.now()) / 60000)} 分钟内有效）`);
+        say("");
+        say("下一步：在 ChatGPT 的连接器设置中添加以上地址（OAuth），并在授权页输入配对码。");
+        say("如果你在使用 Codex Skill，这一步会自动完成。");
+      }
     } catch (error) {
       handleCliError(error, opts.json);
     }
@@ -617,9 +637,11 @@ program
       const openAiConfig = openAiRuntimeConfiguration(process.env, tunnelState.tunnelId);
       const binaries = detectTunnelBinaries();
       tunnelDiagnostic = selection.diagnostic ??
-        (!info.tunnel.running && info.tunnel.detail
-          ? info.tunnel.detail
-          : selection.provider === "openai-secure" && !openAiConfig.complete
+        (info.tunnel.authorizationHealthy === false
+          ? info.tunnel.detail ?? "OPENAI_MCP_AUTHORIZATION_UNHEALTHY"
+          : !info.tunnel.running && info.tunnel.detail
+            ? info.tunnel.detail
+            : selection.provider === "openai-secure" && !openAiConfig.complete
             ? `OPENAI_CONFIGURATION_INCOMPLETE: missing ${openAiConfig.missing.join(" and ")}`
             : selection.provider === "openai-secure" && !binaries.tunnelClient
               ? "NEED_OPENAI_TUNNEL_CLIENT"
@@ -629,13 +651,15 @@ program
     } catch (error) {
       tunnelDiagnostic = (error as Error).message;
     }
+    const tunnelAuthorizationHealthy = info.tunnel.authorizationHealthy !== false;
     const status = {
-      ok: true,
+      ok: tunnelAuthorizationHealthy,
       running: true,
       compatible: true,
-      state: "healthy",
-      lifecycleState: "healthy",
+      state: tunnelAuthorizationHealthy ? "healthy" : "tunnel_authorization_unhealthy",
+      lifecycleState: tunnelAuthorizationHealthy ? "healthy" : "tunnel_authorization_unhealthy",
       tunnelDiagnostic,
+      tunnelAuthorizationHealthy,
       currentWorkspace: {
         workspaceId: workspace.id,
         displayName: workspace.name,
@@ -654,8 +678,13 @@ program
     say("");
     check(`当前 workspace：${workspace.name}（${currentWorkspace ? "已注册" : "未注册"}）`);
     check(`Bridge：运行中（端口 ${info.port}）`);
-    if (info.tunnel.running && info.tunnel.url) check(`安全连接：${mcpUrlForTunnel(info)}`);
-    else say("· 安全连接：未启用（本地模式）");
+    if (info.tunnel.authorizationHealthy === false) {
+      cross(`安全连接：${tunnelDiagnostic ?? "内部授权轮换失败"}`);
+    } else if (info.tunnel.running && info.tunnel.url) {
+      check(`安全连接：${mcpUrlForTunnel(info)}`);
+    } else {
+      say("· 安全连接：未启用（本地模式）");
+    }
     say(`· 已授权连接：${info.tokenCount > 0 ? "是" : "否"}`);
   });
 
@@ -843,11 +872,17 @@ program
           ? [...(!binaries.cloudflared ? ["NEED_CLOUDFLARED"] : [])]
           : [];
       const providerRequired = Boolean(tunnelState?.preference && tunnelState.preference !== "unset") || expectedPublic;
-      if (providerRequired && providerProblems.length > 0 && !info.tunnel.running) {
+      const authorizationUnhealthy = openAiTunnel && info.tunnel.authorizationHealthy === false;
+      if (authorizationUnhealthy) {
+        report.tunnel = {
+          ok: false,
+          detail: info.tunnel.detail ?? "OPENAI_MCP_AUTHORIZATION_UNHEALTHY",
+        };
+      } else if (providerRequired && providerProblems.length > 0 && !info.tunnel.running) {
         report.tunnel = { ok: false, detail: providerProblems.join(", ") };
       }
       let currentUrl = info.publicUrl ?? info.tunnel.url;
-      let healthy = openAiTunnel ? info.tunnel.running : false;
+      let healthy = openAiTunnel ? info.tunnel.running && !authorizationUnhealthy : false;
       if (currentUrl && !openAiTunnel) {
         try {
           const response = await fetch(`${currentUrl}/health`, { signal: AbortSignal.timeout(8000) });
@@ -864,10 +899,17 @@ program
             const previousUrl = lastEndpoint?.publicUrl;
             info = await adminFetch<AdminInfo>(runtime, "GET", "/admin/info");
             currentUrl = info.publicUrl ?? started.url;
-            healthy = openAiTunnel ? info.tunnel.running : true;
+            healthy = openAiTunnel ? info.tunnel.running && info.tunnel.authorizationHealthy !== false : true;
             const sameAddress =
               previousUrl && normalizePublicUrl(previousUrl) === normalizePublicUrl(currentUrl);
-            results.push(sameAddress ? "已重新建立安全连接" : "已重新建立安全连接（地址已更换）");
+            if (healthy) {
+              results.push(sameAddress ? "已重新建立安全连接" : "已重新建立安全连接（地址已更换）");
+            } else {
+              report.tunnel = {
+                ok: false,
+                detail: info.tunnel.detail ?? "OPENAI_MCP_AUTHORIZATION_UNHEALTHY",
+              };
+            }
           }
         } catch (error) {
           report.tunnel = { ok: false, detail: (error as Error).message };
