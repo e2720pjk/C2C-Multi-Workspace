@@ -1,296 +1,221 @@
-# Codex with ChatGPT
+# C2C Multi-Workspace
 
-> ChatGPT thinks. Codex works.
-> ChatGPT 负责思考，Codex 负责干活。
+C2C lets ChatGPT reach local development files through a loopback Bridge and an MCP endpoint.
 
-> [!IMPORTANT]
-> **遇到问题？** 请先向 Codex 发送 **「更新 Codex with ChatGPT」** 并重试。更新到最新版本可以解决大多数已知问题。  
-> **Having trouble?** First ask Codex to **“Update Codex with ChatGPT”** and try again. Updating to the latest version resolves most known issues.
+This fork extends the usual one-project setup: **one C2C installation and one Connector can manage many registered repositories or worktrees**. Workspace selection happens per request, so changing repositories does not require rebuilding the Connector or restarting the tunnel.
 
-## The problem · 解决什么问题
+## Upstream and fork differences
 
-**中文** — ChatGPT 付费订阅的网页版额度大量闲置，Codex 却在消耗紧张的
-API 额度做规划和 Review。本项目把"思考"交给你已付费的网页版 ChatGPT，
-Codex 只负责执行。不用 API Key、不搞逆向代理——官方网页 + 只读 MCP 桥接。
+This repository is a fork and experimental extension of the [upstream C2C project](https://github.com/XiaoDuoYa/codex-with-chatgpt).
 
-**EN** — ChatGPT Plus/Pro web quota sits idle while your coding agent burns
-scarce API/Codex tokens on planning and review. This project moves the
-thinking to the subscription you already pay for; Codex only executes.
-No API keys, no reverse proxy — official web UI plus a read-only MCP bridge.
+The extension adds:
 
-## What it is · 这是什么
+- one installation-level daemon, MCP endpoint, and tunnel for many workspaces;
+- request-scoped workspace ids and aliases, with `list_workspaces` discovery;
+- no Connector or tunnel restart when registering or selecting a workspace;
+- installation ownership checks for builds, PIDs, stale locks, and orphan tunnel clients;
+- optional support for an existing official OpenAI Secure Tunnel.
 
-**中文** — 把 ChatGPT 网页版变成 Codex 编码会话的"规划与审查大脑"，执行权
-完全保留在 Codex 手里。你的仓库永远不会被上传：ChatGPT 通过一条安全的、
-OAuth 保护的**只读** MCP 连接，按需读取当前工作区里它真正需要的那几行代码。
+The implementation is aimed at personal and experimental workflows. See [`docs/`](docs/) for protocol, security, and architecture details.
 
-**EN** — Use the ChatGPT web app as the planning and review brain for your
-Codex coding sessions, while Codex keeps full ownership of execution. Your
-repository is never uploaded: ChatGPT reads exactly the lines it needs through
-a secure, OAuth-protected, **read-only** MCP connection to your current
-workspace.
+## Install
 
-Detailed docs below are in English · 详细中文文档见 **[README.zh-CN.md](README.zh-CN.md)**
+### 1. Requirements
 
-## One-paste install · 一段话安装
+- Node.js 20+
+- pnpm
+- Git
 
-**中文** — 不懂 git、Node、终端？完全不需要懂。把下面这段话原样复制给你的
-编码 Agent（Codex），然后去倒杯咖啡：
+### 2. Clone, build, and install C2C globally
 
-```text
-请帮我完整安装并配置 Codex with ChatGPT，全程自动，我是不懂技术的小白，
-所有事情你自己做：
-
-1. 环境自检：需要 git 和 Node.js ≥ 20，缺什么就自动安装
-  （macOS 用 Homebrew，Windows 用 winget），同时安装 cloudflared。
-2. 下载：把 https://github.com/XiaoDuoYa/codex-with-chatgpt 克隆到
-   ~/codex-with-chatgpt（已存在就 git pull 更新）。
-3. 构建：在该目录里执行 corepack pnpm install 和 corepack pnpm build。
-4. 安装 Skill：把仓库里的 skill/SKILL.md 复制到
-   ~/.codex/skills/codex-with-chatgpt/SKILL.md，并把文件中
-   "The codex-with-chatgpt checkout lives at:" 那一行的路径改成实际克隆路径。
-5. 首次配置：按 SKILL.md 里的 first-time setup 流程执行
-  （运行 c2c setup，用内置浏览器打开 ChatGPT 配置连接器并输入配对码）。
-   全程只用内置浏览器，禁止打开任何第三方浏览器。
-6. 只有遇到需要我登录（ChatGPT / Cloudflare）、验证码或两步验证时才叫我，
-   而且一次只告诉我一个动作。
-7. 完成后给我看 ✓ 清单，并确认文件读取测试通过。我不懂 MCP、OAuth、
-   Tunnel、端口这些词，不要向我解释；出了问题先自己修。
-```
-
-
-**EN** — Don't know git, Node, or terminals? You don't need to. Copy the
-paragraph below, paste it to your coding agent (Codex), and go grab a coffee:
-
-```text
-Please install and configure "Codex with ChatGPT" for me, fully automatically.
-I am a non-technical user — do everything yourself:
-
-1. Check the environment: git and Node.js >= 20 must be available. Install
-   anything missing yourself (macOS: Homebrew, Windows: winget). Also install
-   cloudflared.
-2. Download: clone https://github.com/XiaoDuoYa/codex-with-chatgpt into
-   ~/codex-with-chatgpt (if it already exists, git pull to update).
-3. Build: inside that folder run `corepack pnpm install` then `corepack pnpm build`.
-4. Install the Skill: copy skill/SKILL.md to
-   ~/.codex/skills/codex-with-chatgpt/SKILL.md, and update the line
-   "The codex-with-chatgpt checkout lives at:" to the actual clone path.
-5. First-time setup: follow the SKILL.md "first-time setup" workflow
-   (run c2c setup, configure the ChatGPT connector in the BUILT-IN browser,
-   enter the pairing code). Never open a third-party browser.
-6. Only interrupt me for logins (ChatGPT / Cloudflare), CAPTCHAs or 2FA —
-   and give me exactly ONE action at a time.
-7. When done, show me the ✓ checklist and confirm the file-read test passed.
-   I don't know what MCP, OAuth, tunnels or ports are. Don't explain them.
-   If anything breaks, fix it yourself first.
-```
-
-
-**Updates · 更新** — The Skill checks GitHub once a day and updates itself when a
-new version is released; no action needed. You can also say "更新 Codex with ChatGPT"
-anytime. / Skill 每天自动检查一次 GitHub，有新版本会自动更新，无需任何操作；
-也可以随时对 Codex 说"更新 Codex with ChatGPT"。
-
----
-
-*The sections below are in English. 以下详细内容为英文，中文完整版见
-[README.zh-CN.md](README.zh-CN.md)。*
-
-## Install → Setup → Use (manual)
-
-1. Install the Codex Skill: copy `skill/` to `~/.codex/skills/codex-with-chatgpt/`.
-2. Tell Codex: **"Set up Codex with ChatGPT."** (中文: "使用 Codex with ChatGPT 完成首次配置。")
-3. Use Codex normally: **"Use Codex with ChatGPT to implement XXX."**
-
-That's the whole manual. You don't need to know what MCP, OAuth, tunnels,
-ports or localhost are — Codex configures everything automatically and you
-just see:
-
-```
-Codex with ChatGPT
-
-✓ Project detected
-✓ Workspace Bridge started
-✓ Secure connection established
-✓ ChatGPT connected
-✓ File read test passed
-
-Ready.
-```
-
-The only steps that may need you: logging into ChatGPT (and, if you want a
-stable hostname, logging into Cloudflare once). A **new** workspace also asks
-you to create a ChatGPT Project (collection) once — pick **project-only
-memory**, name it after the workspace. If the sidebar has no Projects row,
-hover **Chats**, open the … menu, and choose **Organize by project**. Codex
-then saves that collection link and starts chats from that page. Existing
-workspaces that already have a C2C chat stay on the old one-conversation
-style until you ask to switch.
-
-### Optional stable hostname
-
-The default public address is a temporary Cloudflare URL. It changes when the
-bridge restarts, and Codex repairs the installation connector by deleting it
-and adding it again. Adding or selecting another workspace does not create a
-connector or restart the tunnel.
-
-If you have a Cloudflare account and a domain already on Cloudflare, first-time
-setup (and the next coding session, once) will ask whether you want a stable
-hostname such as `c2c-<project>.your-domain.com`. That path opens a browser so
-you can authorize Cloudflare. After that, the ChatGPT connector keeps working
-across restarts. If you skip it, or the login fails, Codex stays on the temporary
-address — same features, just a slower repair.
-
-Credentials stay in the OS app state directory, not in the project.
-
-### Optional OpenAI Secure Tunnel
-
-If an existing OpenAI Tunnel is provisioned, use the official `tunnel-client`
-with a runtime key (not `OPENAI_ADMIN_KEY`):
-
-```bash
-export CONTROL_PLANE_TUNNEL_ID=tunnel_...
-export CONTROL_PLANE_API_KEY=...
-c2c tunnel choose --mode openai
-c2c start --tunnel
-```
-
-C2C discovers `tunnel-client` from `PATH` or `C2C_TUNNEL_CLIENT_PATH`, owns one
-installation-level client process, and uses the resulting
-`https://api.openai.com/v1/mcp/<tunnel_id>` connector URL. Tunnel creation and
-delete remain an external provisioning task.
-
-### Multiple workspaces
-
-One installation has one MCP endpoint and one ChatGPT connector. Register
-additional roots without restarting that connector or tunnel:
-
-```bash
-c2c workspace add --workspace /path/to/main --alias main
-c2c workspace add --workspace /path/to/gemini-refactor --alias gemini-refactor
-c2c workspace list --json
-c2c workspace set-default main
-```
-
-ChatGPT can call `list_workspaces`, then pass `workspace: "main"` or the
-returned `workspaceId` to `read_file`, `git_status`, and the other
-workspace-dependent tools. With one enabled workspace omission is convenient;
-with several, set a default explicitly or pass `workspace` on every call.
-Unknown, disabled, removed, or colliding selectors fail instead of falling
-back. See [multi-workspace](docs/multi-workspace.md).
-
-## How it works
-
-```
-             ┌───────────────────────────┐
-             │       ChatGPT Web         │
-             │  Reason / Plan / Review   │
-             └──────────┬──────────▲─────┘
-                        │          │
-               MCP      │          │ Computer Use
-            Data Plane  │          │ Control Plane (<1 KB messages)
-                        ▼          │
-             ┌─────────────────────┐
-             │      C2C Bridge     │   loopback-only HTTP server
-             │  read-only MCP      │   OAuth 2.1 + one-time pairing code
-             │  OAuth + Pairing    │   Cloudflare Quick Tunnel
-             │  Tunnel Manager     │   Cloudflare or official OpenAI client
-             └──────────┬──────────┘
-                        │  request-scoped, read-only
-                        ▼
-             ┌─────────────────────┐          ┌─────────────────────┐
-             │ Registered Workspaces│◀────────│    Codex Harness    │
-             │    A · B · C        │ edit/git │ shell / tests / fix │
-                                              └─────────────────────┘
-```
-
-- **Control plane (Computer Use)**: Codex and ChatGPT exchange tiny structured
-  `[C2C]` state messages — `INIT → PLAN → EXECUTED → REVIEW → DONE`. No diffs,
-  no logs, no file bodies are ever pasted.
-- **Data plane (MCP)**: ChatGPT pulls what it needs itself through the
-  read-only tools. `list_workspaces` discovers the registered targets; every
-  workspace-dependent tool accepts an optional workspace id/alias and otherwise
-  uses the stable default when configured (or the only enabled workspace).
-- **Independent review**: after Codex executes, ChatGPT inspects the actual
-  git diff and test records through MCP — it never trusts "all tests passed"
-  claims blindly.
-
-## Security model (short version)
-
-- **Read-only by construction**: write/delete/shell/commit tools simply do not
-  exist on the server. No prompt injection can enable them.
-- **Registered workspaces are the boundary**: one installation endpoint serves
-  only its explicit workspace registry. Each request is routed by id/alias (or
-  the stable default); canonical realpaths block symlink/`../`/absolute-path
-  escapes and unknown/disabled/ambiguous targets fail closed.
-- **Sensitive files never leave**: `.env*`, keys, SSH, credentials are denied by
-  default (`.env.example` allowed); `.c2cignore` adds your own rules.
-- **Knowing the URL grants nothing**: the public MCP endpoint requires OAuth 2.1
-  (PKCE S256, dynamic client registration, rotating refresh tokens). Tokens
-  authorize the installation, never an unregistered filesystem root.
-- **The model never sees long-lived credentials**: the only secret that ever
-  touches a browser is a one-time pairing code (5-minute TTL, 5 attempts,
-  rate-limited, destroyed on use).
-
-Full threat model: [docs/security.md](docs/security.md)
-
-## For developers
+From the repository checkout:
 
 ```bash
 pnpm install
-pnpm build          # -> dist/, exposes the `c2c` bin
-pnpm test           # vitest: path security, OAuth, lifecycle, tunnel, pairing, MCP e2e
-
-c2c setup           # bridge + tunnel + pairing code, all in one
-c2c sandbox-allow   # whitelist the settings dir in Codex (macOS + Windows)
-c2c status / doctor / pair / unpair / logs / stop
-c2c workspace add/list/set-default/enable/disable/remove
+pnpm build
+pnpm install -g .
 ```
 
-Requirements: Node.js >= 20, git. `cloudflared` for the Cloudflare public
-connection (auto-detected; the Skill installs it for you). The OpenAI option
-uses an already installed official `tunnel-client`; set
-`C2C_TUNNEL_CLIENT_PATH` when it is not on PATH. If QUIC is blocked, set
-`C2C_TUNNEL_PROTOCOL=http2` and restart the bridge.
+Verify the CLI:
 
-Docs: [multi-workspace](docs/multi-workspace.md) · [architecture](docs/architecture.md) ·
-[protocol](docs/protocol.md) · [security](docs/security.md) · [troubleshooting](docs/troubleshooting.md)
-
-## Project layout
-
-```
-src/
-  bridge/     loopback HTTP server, port recovery, admin API
-  mcp/        workspace-aware read-only tools, stateless Streamable HTTP
-  auth/       OAuth 2.1 (PKCE, DCR, refresh rotation, revocation)
-  pairing/    one-time pairing codes (CSPRNG, TTL, rate limits)
-  workspace/  registry, path containment, sensitive-file policy, search, git
-  tunnel/     TunnelProvider + Cloudflare Quick/Named + OpenAI tunnel-client
-  execution/  execution records for the review loop
-  process/    daemon lifecycle
-  cli/        the c2c CLI
-skill/        the Codex Skill (the real UX layer)
-tests/        unit + integration tests
-docs/         architecture / protocol / security / troubleshooting
+```bash
+c2c --help
 ```
 
-## Status & disclaimer
+### 3. Install a tunnel dependency (optional for local-only use)
 
-V1. Verified end-to-end: bridge, OAuth + pairing, public tunnel, ChatGPT
-connector setup, zero-touch first-run experience.
+On macOS, choose one of these short paths:
 
-**Unofficial community project. Not affiliated with or endorsed by OpenAI.**
+**Cloudflare Quick or Named Tunnel**
+
+```bash
+brew install cloudflared
+cloudflared --version
+```
+
+See the [official Cloudflare `cloudflared` installation documentation](https://developers.cloudflare.com/tunnel/downloads/). Named tunnels also need a Cloudflare account and a domain already in Cloudflare.
+
+**OpenAI Secure Tunnel**
+
+```bash
+brew install openai/tools/tunnel-client
+tunnel-client --version
+```
+
+See the [official OpenAI `tunnel-client` repository](https://github.com/openai/tunnel-client). This installs the official client; C2C still needs an existing Tunnel ID and Runtime API Key.
+
+For Linux or Windows installation, see the relevant official documentation above.
+
+### 4. First setup
+
+For a public connection:
+
+```bash
+c2c setup
+```
+
+To use only the local Bridge:
+
+```bash
+c2c setup --no-tunnel
+```
+
+`setup` starts the Bridge and, when a public tunnel is enabled, prints the connection and pairing information for the ChatGPT Connector. `setup --no-tunnel` starts only the local Bridge for development or local testing; it does not provide a public endpoint for a remote ChatGPT Connector.
+
+## Tunnel choices
+
+### Cloudflare Quick
+
+```bash
+brew install cloudflared
+c2c tunnel choose --mode quick
+```
+
+Fastest to start; the public URL may change after a restart.
+
+### Cloudflare Named
+
+```bash
+brew install cloudflared
+c2c tunnel choose --mode named --zone example.com
+```
+
+Needs a Cloudflare account and a domain already added to Cloudflare.
+
+### OpenAI Secure Tunnel
+
+```bash
+brew install openai/tools/tunnel-client
+export CONTROL_PLANE_TUNNEL_ID=tunnel_...
+export CONTROL_PLANE_API_KEY=...
+c2c tunnel choose --mode openai
+```
+
+This uses an existing OpenAI Tunnel and the official `tunnel-client`. The Runtime API Key is used only at runtime, `OPENAI_ADMIN_KEY` is not required, and C2C does not create or delete Tunnel resources. Start the public connection with `c2c start --tunnel` when needed.
+
+## CLI: what do I want to do?
+
+### I want to start the current project
+
+```bash
+c2c start --tunnel
+c2c status
+```
+
+Use `c2c start` without `--tunnel` for a local-only Bridge. Use `c2c setup` the first time when you also need pairing instructions.
+
+### I want to add another repository or worktree
+
+Run this from any directory; the path and alias are explicit:
+
+```bash
+c2c workspace add --workspace /path/to/repository --alias main
+c2c workspace add --workspace /path/to/worktree --alias review
+c2c workspace list
+```
+
+Registration updates the existing installation. It does not create another daemon, Connector, or tunnel.
+
+### I want to choose a default workspace
+
+With one enabled workspace, tools can usually omit the selector. With multiple enabled workspaces, either pass a workspace id or alias on each workspace-dependent call or set a default:
+
+```bash
+c2c workspace set-default main
+c2c workspace list
+```
+
+An ambiguous or missing selection fails closed instead of silently targeting a different repository.
+
+### I want to inspect, repair, restart, or stop C2C
+
+```bash
+c2c status   # current lifecycle and tunnel state
+c2c doctor   # diagnostics and supported connection repair
+c2c restart  # replace the installation daemon
+c2c stop     # stop the installation daemon
+```
+
+### I want to choose a tunnel
+
+```bash
+c2c tunnel status
+c2c tunnel choose --mode quick
+c2c tunnel choose --mode named --zone example.com
+c2c tunnel choose --mode openai
+```
+
+OpenAI selection validates the Tunnel ID, Runtime API Key, and official client before taking down a healthy existing daemon. Named-tunnel provisioning is completed before the installation state is changed; a failed candidate does not unnecessarily remove the current connection.
+
+## Multi-workspace model
+
+```text
+ChatGPT
+   ↓
+one C2C Connector / MCP endpoint
+   ├── Workspace A
+   ├── Workspace B
+   └── Workspace C
+```
+
+- The Connector and tunnel belong to the installation, not to an individual workspace.
+- Workspace-dependent tools accept a workspace id or alias and return `workspaceId` in their results.
+- `list_workspaces` is the stable discovery tool.
+- If C2C cannot determine one safe workspace, it returns an error rather than guessing.
+
+## Lifecycle and safety
+
+- An installation has one daemon and one installation-owned tunnel.
+- An incompatible build is not silently reused.
+- A same-contract build upgrade can replace a daemon only after ownership and admin authority are verified.
+- An unverifiable PID, reused PID, corrupt lock, or unknown owner is never killed directly.
+- Corrupt or unsupported canonical state fails closed.
+
+If canonical state ever needs a manual reset, first confirm that the old C2C daemon and any `tunnel-client` have stopped. Only then reset local C2C state and run setup again. Do not delete ownership state while a process may still be running.
+
+## Current limitations
+
+- Runtime-contract mismatches do not automatically take over or migrate a daemon.
+- Real OpenAI Secure Tunnel behavior still requires a valid external Tunnel, Runtime API Key, and official client; fake-process tests are not control-plane E2E.
+- Historical persisted-state migration is intentionally not maintained.
+- This fork is currently intended for personal and experimental multi-repository workflows.
+
+## Uninstall
+
+```bash
+pnpm remove -g codex-with-chatgpt
+```
+
+## Development
+
+```bash
+pnpm typecheck
+pnpm build
+pnpm test
+```
+
+More detail: [`docs/architecture.md`](docs/architecture.md), [`docs/multi-workspace.md`](docs/multi-workspace.md), [`docs/security.md`](docs/security.md), and [`docs/troubleshooting.md`](docs/troubleshooting.md).
 
 ## License
 
-[MIT](LICENSE)
-
-## Star History
-
-<a href="https://www.star-history.com/?repos=xiaoduoya%2Fcodex-with-chatgpt&type=date&legend=top-left">
- <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=xiaoduoya/codex-with-chatgpt&type=date&theme=dark&legend=top-left" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=xiaoduoya/codex-with-chatgpt&type=date&legend=top-left" />
-   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=xiaoduoya/codex-with-chatgpt&type=date&legend=top-left" />
- </picture>
-</a>
+MIT
