@@ -20,7 +20,11 @@ import { CloudflaredQuickTunnel } from "../tunnel/cloudflared.js";
 import { CloudflaredNamedTunnel } from "../tunnel/cloudflared-named.js";
 import { OpenAiSecureTunnel, type TunnelAuthorization } from "../tunnel/openai-secure.js";
 import type { TunnelProvider } from "../tunnel/provider.js";
-import { namedTunnelBinding, readInstallationTunnelState } from "../tunnel/state.js";
+import {
+  namedTunnelBinding,
+  readInstallationTunnelState,
+  selectTunnelProvider,
+} from "../tunnel/state.js";
 import { Logger, nullLogger } from "../logger/index.js";
 import { DEFAULT_HOST, DEFAULT_PORT, getStateDir } from "../config/paths.js";
 import { RUNTIME_BUILD_ID, RUNTIME_CONTRACT_ID, SERVICE_NAME, VERSION } from "../version.js";
@@ -32,25 +36,29 @@ import {
 } from "./runtime.js";
 
 function tunnelForInstallation(
-  defaultWorkspaceId: string,
+  _defaultWorkspaceId: string,
   logger: Logger,
-  mcpAuthorization?: () => TunnelAuthorization | Promise<TunnelAuthorization>
+  mcpAuthorization?: () => TunnelAuthorization | Promise<TunnelAuthorization>,
+  onAuthorizationInvalidated?: () => void,
+  usePersistedState = true
 ): TunnelProvider {
-  const state = readInstallationTunnelState(defaultWorkspaceId);
-  const openaiConfigured = Boolean(process.env.CONTROL_PLANE_TUNNEL_ID && process.env.CONTROL_PLANE_API_KEY);
-  if (
-    state.preference === "openai" ||
-    (state.preference === "unset" &&
-      (process.env.C2C_TUNNEL_PROVIDER?.trim().toLowerCase() === "openai" || openaiConfigured))
-  ) {
+  // Non-persisted embedded bridges are isolated test/consumer instances; they
+  // must not inherit the user's installation provider choice.
+  const state = usePersistedState
+    ? readInstallationTunnelState()
+    : { workspaceId: INSTALLATION_WORKSPACE_ID, preference: "unset" as const };
+  const selection = selectTunnelProvider(state, usePersistedState ? process.env : {});
+  if (selection.provider === "openai-secure") {
     return new OpenAiSecureTunnel({
       logger,
-      tunnelId: process.env.CONTROL_PLANE_TUNNEL_ID?.trim() || state.tunnelId,
+      tunnelId: state.tunnelId || process.env.CONTROL_PLANE_TUNNEL_ID?.trim(),
       mcpAuthorization,
+      onAuthorizationInvalidated,
     });
   }
   const binding = namedTunnelBinding(state);
-  if (binding) {
+  if (selection.provider === "cloudflare-named") {
+    if (!binding) throw new Error("CONFIGURED_PROVIDER_UNAVAILABLE: persisted named tunnel state is incomplete.");
     return new CloudflaredNamedTunnel({
       tunnelName: binding.tunnelName,
       hostname: binding.hostname,
@@ -75,6 +83,10 @@ export interface BridgeOptions {
   tunnelProvider?: TunnelProvider;
   /** Persist runtime state (disable in tests). */
   persistRuntime?: boolean;
+  /** Deterministic build identity seam for lifecycle tests; production uses the computed id. */
+  runtimeBuildId?: string;
+  /** Test seam: production daemons exit after an authenticated shutdown request. */
+  exitOnShutdown?: boolean;
   authStoreFile?: string;
   pairingTtlMs?: number;
   accessTokenTtlMs?: number;
@@ -120,6 +132,8 @@ function listen(app: express.Express, host: string, preferredPort: number): Prom
 
 export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
   const logger = opts.logger ?? nullLogger;
+  const runtimeBuildId = opts.runtimeBuildId ?? RUNTIME_BUILD_ID;
+  const exitOnShutdown = opts.exitOnShutdown ?? true;
   const host = opts.host ?? DEFAULT_HOST;
   if (host !== "127.0.0.1" && host !== "::1" && host !== "localhost") {
     throw new Error("The bridge only binds to loopback addresses. Public exposure goes through the tunnel.");
@@ -180,7 +194,7 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
   const pairing = new PairingManager(INSTALLATION_WORKSPACE_ID, { ttlMs: opts.pairingTtlMs });
   // One provider belongs to the bridge/installation, never to a tool call.
   const tunnel =
-    opts.tunnelProvider ?? tunnelForInstallation(workspace.id, logger, getTunnelAuthorization);
+    opts.tunnelProvider ?? tunnelForInstallation(workspace.id, logger, getTunnelAuthorization, clearTunnelAuthorization, ownsInstallation);
   const adminToken = `c2c_admin_${randomBytes(24).toString("base64url")}`;
 
   let publicBaseUrl: string | null = null;
@@ -215,7 +229,7 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
       service: SERVICE_NAME,
       version: VERSION,
       contractId: RUNTIME_CONTRACT_ID,
-      buildId: RUNTIME_BUILD_ID,
+      buildId: runtimeBuildId,
       installationId,
       pid: process.pid,
       port,
@@ -291,7 +305,7 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
       service: SERVICE_NAME,
       version: VERSION,
       contractId: RUNTIME_CONTRACT_ID,
-      buildId: RUNTIME_BUILD_ID,
+      buildId: runtimeBuildId,
       installationId,
       ...snapshot,
       workspaceName: workspace.name,
@@ -338,7 +352,9 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
 
   app.post("/admin/tunnel/stop", adminGuard, (_req, res) => {
     void withTunnelOperation(async () => {
-      if (tunnel.status().running) await tunnel.stop();
+      // Stop even when a provider child is still starting and therefore is not
+      // yet reported as ready; otherwise its credential remains live.
+      await tunnel.stop();
       clearTunnelAuthorization();
       publicBaseUrl = null;
       persistRuntime();
@@ -351,8 +367,10 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
     const count = authStore.revokeAll();
     pairing.invalidateAll();
     clearTunnelAuthorization();
+    const tunnelStatus = tunnel.status();
+    const tunnelHasChild = tunnelStatus.running || Boolean(tunnelStatus.detail?.includes("running"));
     const operation =
-      tunnel.name === "openai-secure" && tunnel.status().running
+      tunnel.name === "openai-secure" && tunnelHasChild
         ? withTunnelOperation(async () => {
             const url = await tunnel.restart(port);
             publicBaseUrl = url;
@@ -370,13 +388,26 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
   app.post("/admin/shutdown", adminGuard, (_req, res) => {
     res.json({ shuttingDown: true });
     setTimeout(() => {
-      void shutdown().then(() => process.exit(0));
+      void shutdown()
+        .then(() => {
+          if (exitOnShutdown) process.exit(0);
+        })
+        .catch((error: Error) => logger.error(`Bridge shutdown failed: ${error.message}`));
     }, 100);
   });
 
   let ownerLock: StateLock | null = null;
   if (ownsInstallation) {
     ownerLock = await acquireStateLockAsync(path.join(getStateDir(), "runtime", "installation-owner.lock"), { timeoutMs: 250 });
+    // Only the verified installation owner may revoke a previous internal
+    // tunnel authorization; a direct second serve must fail at the lock first.
+    try {
+      authStore.revokeClientTokens("c2c-openai-tunnel");
+    } catch (error) {
+      ownerLock.release();
+      ownerLock = null;
+      throw error;
+    }
   }
 
   let server: Server;
@@ -404,8 +435,9 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
       defaultWorkspaceId: legacySingle ? undefined : registry.defaultWorkspaceId(),
       installationId: legacySingle ? undefined : installationId,
       contractId: legacySingle ? undefined : RUNTIME_CONTRACT_ID,
-      buildId: legacySingle ? undefined : RUNTIME_BUILD_ID,
+      buildId: legacySingle ? undefined : runtimeBuildId,
       ownerToken: legacySingle ? undefined : ownerLock?.owner.token,
+      processIdentity: legacySingle ? undefined : ownerLock?.owner.processIdentity,
       pid: process.pid,
       port,
       adminToken,
@@ -427,9 +459,15 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
     if (closed) return;
     closed = true;
     // Do not release the installation owner while a tunnel child may still be alive.
-    await withTunnelOperation(() => tunnel.stop()).catch((error: Error) => {
-      logger.error(`Tunnel stop failed during shutdown: ${error.message}`);
-    });
+    try {
+      await withTunnelOperation(() => tunnel.stop());
+    } catch (error) {
+      // Keep the daemon owner and runtime authoritative while a child may
+      // still be alive; releasing them would permit an overlapping tunnel.
+      logger.error(`Tunnel stop failed during shutdown: ${(error as Error).message}`);
+      closed = false;
+      throw error;
+    }
     clearTunnelAuthorization();
     await new Promise<void>((resolve) => server.close(() => resolve()));
     if (ownsInstallation) clearInstallationRuntime();

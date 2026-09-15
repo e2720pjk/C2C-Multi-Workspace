@@ -1,4 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import fs from "node:fs";
 import path from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
@@ -103,6 +104,42 @@ describe("installation multi-workspace routing", () => {
     cleanup(a);
     cleanup(b);
     delete process.env.C2C_STATE_DIR;
+  });
+
+  it("uses one canonical alias key for registration, selection, and persisted validation", () => {
+    const registry = new WorkspaceRegistry({ persist: false });
+    registry.register(a, { alias: "Foo" });
+    expect(registry.resolve("  ｆｏｏ  ").id).toBe(new Workspace(a).id);
+    expect(() => registry.register(b, { alias: "foo" })).toThrow(/already registered|collision/i);
+
+    const persisted = path.join(process.env.C2C_STATE_DIR!, "alias-collision.json");
+    const first = new Workspace(a);
+    const second = new Workspace(b);
+    fs.writeFileSync(persisted, JSON.stringify({
+      version: 1,
+      defaultWorkspaceId: null,
+      workspaces: [
+        {
+          workspaceId: first.id,
+          alias: "Foo",
+          displayName: "A",
+          root: first.root,
+          enabled: true,
+          registeredAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+        },
+        {
+          workspaceId: second.id,
+          alias: "Ｆｏｏ",
+          displayName: "B",
+          root: second.root,
+          enabled: true,
+          registeredAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+        },
+      ],
+    }));
+    expect(() => new WorkspaceRegistry({ file: persisted })).toThrow(/alias collision/i);
   });
 
   it("discovers both registered roots without returning absolute paths", async () => {

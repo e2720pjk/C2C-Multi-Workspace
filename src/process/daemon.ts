@@ -2,19 +2,24 @@ import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { acquireStateLockAsync, inspectStateLock } from "../config/lock.js";
+import {
+  acquireStateLockAsync,
+  inspectStateLock,
+  processStateForPid,
+  type StateLock,
+} from "../config/lock.js";
 import { ensureInstallationIdentity, readInstallationIdentity } from "../config/installation.js";
 import { ensureDir, getStateDir } from "../config/paths.js";
 import {
-  findBridgeObservation,
   findInstallationObservation,
+  clearInstallationRuntime,
   findLiveBridge,
   probeBridge,
   readInstallationRuntime,
   readRuntimeState,
   type RuntimeState,
 } from "../bridge/runtime.js";
-import { RUNTIME_BUILD_ID, RUNTIME_CONTRACT_ID } from "../version.js";
+import { RUNTIME_BUILD_ID, RUNTIME_CONTRACT_ID, SERVICE_NAME } from "../version.js";
 import { Workspace } from "../workspace/manager.js";
 import { WorkspaceRegistry } from "../workspace/registry.js";
 
@@ -36,6 +41,16 @@ function cliEntry(): { cmd: string; args: string[] } {
 
 function startupLockFile(): string {
   return path.join(getStateDir(), "runtime", "installation-start.lock");
+}
+
+/** Serialize installation mutations with daemon startup without adding another lifecycle lock. */
+export async function withInstallationStartupLock<T>(operation: (lock: StateLock) => Promise<T>): Promise<T> {
+  const lock = await acquireStateLockAsync(startupLockFile(), { timeoutMs: 35_000 });
+  try {
+    return await operation(lock);
+  } finally {
+    lock.release();
+  }
 }
 
 function ownerLockFile(): string {
@@ -106,9 +121,19 @@ export async function ensureBridge(
       return { runtime: await refreshInstallationRuntime(observation.runtime), spawned: false };
     }
     if (observation.state === "unknown") {
-      throw new Error(
-        `Bridge state is uncertain (${observation.reason}); refusing to start another bridge.`
-      );
+      if (observation.reason === "build_mismatch" && observation.runtime && identity) {
+        await shutdownOwnedRuntime(observation.runtime, identity.installationId);
+        observation = await findInstallationObservation(workspace.id, {
+          expectedInstallationId: identity.installationId,
+          expectedContractId: RUNTIME_CONTRACT_ID,
+          expectedBuildId: RUNTIME_BUILD_ID,
+        });
+      }
+      if (observation.state === "unknown") {
+        throw new Error(
+          `Bridge state is uncertain (${observation.reason}); refusing to start another bridge.`
+        );
+      }
     }
     const owner = inspectStateLock(ownerLockFile());
     if (owner.state === "held") {
@@ -124,9 +149,15 @@ export async function ensureBridge(
       return { runtime: await refreshInstallationRuntime(observation.runtime), spawned: false };
     }
     if (observation.state === "unknown") {
-      throw new Error(
-        `Bridge state is uncertain (${observation.reason}); refusing to start another bridge.`
-      );
+      if (observation.reason === "build_mismatch" && observation.runtime) {
+        await shutdownOwnedRuntime(observation.runtime, identity.installationId);
+        observation = await findInstallationObservation(workspace.id, expected);
+      }
+      if (observation.state === "unknown") {
+        throw new Error(
+          `Bridge state is uncertain (${observation.reason}); refusing to start another bridge.`
+        );
+      }
     }
 
     const logDir = ensureDir(path.join(getStateDir(), "logs"));
@@ -195,6 +226,136 @@ export async function adminFetch<T = unknown>(
   }
 }
 
+interface AdminRuntimeProof {
+  service?: string;
+  installationId?: string;
+  contractId?: string;
+  buildId?: string;
+  pid?: number;
+  port?: number;
+}
+
+/**
+ * Build compatibility is a reuse check, not an ownership check. This proof
+ * deliberately ignores the expected build while requiring every independent
+ * ownership signal before asking an older daemon to shut itself down.
+ */
+async function proveOwnedRuntimeForShutdown(
+  runtime: RuntimeState,
+  installationId: string
+): Promise<void> {
+  if (
+    runtime.installationId !== installationId ||
+    !runtime.ownerToken ||
+    !runtime.adminToken ||
+    !runtime.buildId ||
+    !runtime.contractId
+  ) {
+    throw new Error("Bridge ownership cannot be proved from the canonical runtime state.");
+  }
+  const owner = inspectStateLock(ownerLockFile());
+  if (owner.state === "unknown") {
+    throw new Error(`Bridge ownership cannot be proved (${owner.reason}).`);
+  }
+  if (
+    owner.state !== "held" ||
+    owner.owner.pid !== runtime.pid ||
+    owner.owner.token !== runtime.ownerToken ||
+    (runtime.processIdentity !== undefined && runtime.processIdentity !== owner.owner.processIdentity)
+  ) {
+    throw new Error("Bridge ownership cannot be proved from the installation owner lease.");
+  }
+
+  const observed = await findInstallationObservation(undefined, {
+    expectedInstallationId: installationId,
+    expectedContractId: runtime.contractId,
+  });
+  if (observed.state !== "healthy" || observed.runtime.pid !== runtime.pid) {
+    throw new Error(
+      `Bridge ownership cannot be proved from runtime/health consistency (${observed.state}${observed.state === "unknown" ? `: ${observed.reason}` : ""}).`
+    );
+  }
+
+  let info: AdminRuntimeProof;
+  try {
+    info = await adminFetch<AdminRuntimeProof>(runtime, "GET", "/admin/info", 5_000);
+  } catch (error) {
+    throw new Error(`Bridge admin authority cannot be verified: ${(error as Error).message}`);
+  }
+  if (
+    info.service !== SERVICE_NAME ||
+    info.installationId !== installationId ||
+    info.contractId !== runtime.contractId ||
+    info.buildId !== runtime.buildId ||
+    info.pid !== runtime.pid ||
+    info.port !== runtime.port
+  ) {
+    throw new Error("Bridge admin authority does not match the canonical runtime state.");
+  }
+  if (!owner.owner.processIdentity) {
+    throw new Error("Bridge owner process identity cannot be verified.");
+  }
+}
+
+async function shutdownOwnedRuntime(runtime: RuntimeState, installationId: string): Promise<void> {
+  await proveOwnedRuntimeForShutdown(runtime, installationId);
+  await adminFetch(runtime, "POST", "/admin/shutdown", 5_000);
+
+  const deadline = Date.now() + 10_000;
+  while (Date.now() < deadline) {
+    const owner = inspectStateLock(ownerLockFile());
+    if (owner.state === "unknown") {
+      throw new Error(`Bridge shutdown ownership became unverifiable (${owner.reason}).`);
+    }
+    if (
+      owner.state === "held" &&
+      (owner.owner.pid !== runtime.pid || owner.owner.token !== runtime.ownerToken)
+    ) {
+      throw new Error("A different process acquired the installation owner lease during shutdown.");
+    }
+    if (owner.state === "held") {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      continue;
+    }
+
+    const current = readInstallationRuntime();
+    if (current) {
+      if (current.pid !== runtime.pid || current.ownerToken !== runtime.ownerToken) {
+        throw new Error("Canonical runtime state changed to an unverifiable owner during shutdown.");
+      }
+      const processState = processStateForPid(runtime.pid);
+      if (processState === "unknown") {
+        throw new Error("Bridge PID identity became unverifiable during shutdown.");
+      }
+      if (processState === "present") {
+        const health = await probeBridge(runtime.port);
+        if (health?.pid === runtime.pid) {
+          await new Promise((resolve) => setTimeout(resolve, 100));
+          continue;
+        }
+        throw new Error("Bridge owner lease was released while the daemon process remained alive.");
+      }
+      clearInstallationRuntime();
+      return;
+    }
+
+    // The authenticated daemon has released its lease and removed the
+    // canonical runtime. Do not kill or infer ownership from a PID that may
+    // already be a zombie/reused process; a live C2C response on the port is
+    // the only remaining overlap signal.
+    const health = await probeBridge(runtime.port);
+    if (health?.pid === runtime.pid && health.installationId === installationId) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      continue;
+    }
+    if (health?.pid === runtime.pid && health.installationId !== installationId) {
+      throw new Error("Bridge port still serves a different installation after shutdown.");
+    }
+    return;
+  }
+  throw new Error("Bridge did not finish graceful shutdown within 10s.");
+}
+
 /** Stop the installation, never merely the workspace named by the cwd. */
 async function stopBridgeImpl(_workspaceRoot?: string): Promise<boolean> {
   let identity: ReturnType<typeof readInstallationIdentity> = null;
@@ -226,44 +387,34 @@ async function stopBridgeImpl(_workspaceRoot?: string): Promise<boolean> {
     throw new Error(`Bridge state is stopped but not safely attributable (${observation.reason}).`);
   }
   if (observation.state === "unknown") {
+    if (observation.reason === "build_mismatch" && observation.runtime && identity) {
+      try {
+        await shutdownOwnedRuntime(observation.runtime, identity.installationId);
+        return true;
+      } catch (error) {
+        throw new Error(`Bridge is owned by this installation but graceful shutdown failed: ${(error as Error).message}`);
+      }
+    }
     throw new Error(
       `Bridge state is uncertain (${observation.reason}); refusing to terminate an unverifiable process.`
     );
   }
 
   try {
-    await adminFetch(observation.runtime, "POST", "/admin/shutdown", 5_000);
-    const deadline = Date.now() + 10_000;
-    while (Date.now() < deadline) {
-      const after = await findInstallationObservation(workspaceId, {
-        expectedInstallationId: identity?.installationId,
-        expectedContractId: RUNTIME_CONTRACT_ID,
-        expectedBuildId: RUNTIME_BUILD_ID,
-      });
-      if (after.state === "stopped") return true;
-      if (
-        after.state === "unknown" &&
-        after.reason !== "ownership_conflict" &&
-        after.reason !== "pid_unknown" &&
-        after.reason !== "probe_failed"
-      ) {
-        throw new Error(`shutdown ownership became uncertain (${after.reason})`);
-      }
-      await new Promise((resolve) => setTimeout(resolve, 100));
-    }
-    throw new Error("Bridge did not finish shutting down within 10s.");
+    await shutdownOwnedRuntime(observation.runtime, identity?.installationId ?? "");
+    return true;
   } catch (error) {
     throw new Error(`Bridge is owned by this installation but graceful shutdown failed: ${(error as Error).message}`);
   }
 }
 
 /** Stop serializes with startup so a concurrent start cannot reuse a daemon mid-shutdown. */
-export async function stopBridge(workspaceRoot?: string): Promise<boolean> {
-  const lock = await acquireStateLockAsync(startupLockFile(), { timeoutMs: 35_000 });
+export async function stopBridge(workspaceRoot?: string, heldStartupLock?: StateLock): Promise<boolean> {
+  const lock = heldStartupLock ?? (await acquireStateLockAsync(startupLockFile(), { timeoutMs: 35_000 }));
   try {
     return await stopBridgeImpl(workspaceRoot);
   } finally {
-    lock.release();
+    if (!heldStartupLock) lock.release();
   }
 }
 

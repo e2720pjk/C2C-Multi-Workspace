@@ -1,14 +1,14 @@
 import fs from "node:fs";
 import path from "node:path";
-import { inspectStateLock } from "../config/lock.js";
+import { inspectStateLock, processIdentityForPid } from "../config/lock.js";
 import { readInstallationIdentity } from "../config/installation.js";
 import { DEFAULT_PORT, ensureDir, getStateDir, readJsonStrict, writeSecureJson } from "../config/paths.js";
 import { RUNTIME_BUILD_ID, RUNTIME_CONTRACT_ID, SERVICE_NAME, VERSION } from "../version.js";
 
 /**
- * Installation runtime state. Legacy fields remain optional so old test and
- * embedded callers can still inspect a single-workspace runtime, but a normal
- * daemon always writes installationId, contractId, and ownerToken.
+ * Installation runtime state. The persisted daemon form is the installation
+ * schema; optional fields only support non-persisted embedded bridges and
+ * diagnostics for obsolete files.
  */
 export interface RuntimeState {
   service: string;
@@ -21,6 +21,7 @@ export interface RuntimeState {
   contractId?: string;
   buildId?: string;
   ownerToken?: string;
+  processIdentity?: string | null;
   pid: number;
   port: number;
   adminToken: string;
@@ -38,26 +39,32 @@ export function runtimeFile(workspaceId: string): string {
 }
 
 export function writeRuntimeState(state: RuntimeState): void {
-  if (state.workspaceIds && state.workspaceIds.length > 0) {
+  if (state.workspaceIds !== undefined || state.installationId || state.contractId || state.ownerToken) {
     writeSecureJson(installationRuntimeFile(), state);
     return;
   }
+  // Obsolete files are retained only as an explicit fixture/diagnostic seam;
+  // lifecycle readers never use them as a source of truth.
   writeSecureJson(runtimeFile(state.workspaceId), state);
 }
 
 interface RuntimeRead {
-  state: "missing" | "valid" | "corrupt";
+  state: "missing" | "valid" | "corrupt" | "unsupported";
   runtime: RuntimeState | null;
+  reason?: string;
 }
 
-function readRuntimeFile(file: string): RuntimeRead {
+function readRuntimeFile(file: string, canonical = false): RuntimeRead {
   if (!fs.existsSync(file)) return { state: "missing", runtime: null };
   try {
     const value = readJsonStrict<unknown>(file);
     if (!value || typeof value !== "object" || Array.isArray(value)) {
       return { state: "corrupt", runtime: null };
     }
-    const runtime = value as Partial<RuntimeState>;
+    const runtime = value as Partial<RuntimeState> & { schemaVersion?: unknown };
+    if (canonical && runtime.schemaVersion !== undefined && runtime.schemaVersion !== 1) {
+      return { state: "unsupported", runtime: null, reason: `runtime schema ${String(runtime.schemaVersion)} is unsupported` };
+    }
     const pid = runtime.pid;
     const port = runtime.port;
     if (
@@ -81,9 +88,17 @@ function readRuntimeFile(file: string): RuntimeRead {
       (runtime.installationId !== undefined && typeof runtime.installationId !== "string") ||
       (runtime.contractId !== undefined && typeof runtime.contractId !== "string") ||
       (runtime.buildId !== undefined && typeof runtime.buildId !== "string") ||
-      (runtime.ownerToken !== undefined && typeof runtime.ownerToken !== "string")
+      (runtime.ownerToken !== undefined && typeof runtime.ownerToken !== "string") ||
+      (runtime.processIdentity !== undefined && runtime.processIdentity !== null && typeof runtime.processIdentity !== "string")
     ) {
       return { state: "corrupt", runtime: null };
+    }
+    if (
+      canonical &&
+      (!runtime.installationId || !runtime.contractId || !runtime.buildId || !runtime.ownerToken ||
+        !Array.isArray(runtime.workspaceIds) || runtime.workspaceIds.length === 0)
+    ) {
+      return { state: "unsupported", runtime: null, reason: "runtime is not the canonical installation schema" };
     }
     return { state: "valid", runtime: { ...runtime, pid, port } as RuntimeState };
   } catch {
@@ -92,7 +107,7 @@ function readRuntimeFile(file: string): RuntimeRead {
 }
 
 function readInstallationRuntimeResult(): RuntimeRead {
-  return readRuntimeFile(installationRuntimeFile());
+  return readRuntimeFile(installationRuntimeFile(), true);
 }
 
 function legacyRuntimeReads(): RuntimeRead[] {
@@ -113,12 +128,9 @@ export function readInstallationRuntime(): RuntimeState | null {
   return result.state === "valid" ? result.runtime : null;
 }
 
-export function readRuntimeState(workspaceId: string): RuntimeState | null {
+export function readRuntimeState(_workspaceId?: string): RuntimeState | null {
   const installation = readInstallationRuntimeResult();
-  if (installation.state === "valid") return installation.runtime;
-  if (installation.state === "corrupt") return null;
-  const legacy = readRuntimeFile(runtimeFile(workspaceId));
-  return legacy.state === "valid" ? legacy.runtime : null;
+  return installation.state === "valid" ? installation.runtime : null;
 }
 
 export function clearInstallationRuntime(): void {
@@ -167,6 +179,7 @@ export async function probeBridge(
     const boundPort = typeof body.port === "number" ? body.port : NaN;
     if (
       body.service !== SERVICE_NAME ||
+      body.status !== "ok" ||
       !Number.isInteger(pid) ||
       pid <= 0 ||
       !Number.isInteger(boundPort) ||
@@ -203,6 +216,9 @@ export type BridgeObservation =
         | "pid_unknown"
         | "workspace_mismatch"
         | "runtime_corrupt"
+        | "unsupported_state_schema"
+        | "corrupt_canonical_state"
+        | "process_identity_unverifiable"
         | "ownership_conflict"
         | "contract_mismatch"
         | "build_mismatch"
@@ -213,6 +229,8 @@ export interface ObservationOptions {
   expectedInstallationId?: string;
   expectedContractId?: string;
   expectedBuildId?: string;
+  /** Deterministic probe seam for isolated-installation tests. */
+  probe?: (port: number) => Promise<HealthPayload | null>;
 }
 
 function observePid(pid: number): "present" | "missing" | "unknown" {
@@ -231,6 +249,9 @@ function inspectRuntime(
   options: ObservationOptions
 ): Promise<BridgeObservation> {
   if (read.state === "missing") return Promise.resolve({ state: "stopped", runtime: null, reason: "runtime_missing" });
+  if (read.state === "unsupported") {
+    return Promise.resolve({ state: "unknown", runtime: null, reason: "unsupported_state_schema" });
+  }
   if (read.state === "corrupt" || !read.runtime) {
     return Promise.resolve({ state: "unknown", runtime: null, reason: "runtime_corrupt" });
   }
@@ -238,13 +259,20 @@ function inspectRuntime(
   if (runtime.ownerToken || runtime.installationId) {
     const owner = inspectStateLock(path.join(getStateDir(), "runtime", "installation-owner.lock"));
     if (owner.state === "unknown") {
-      return Promise.resolve({ state: "unknown", runtime, reason: "ownership_conflict" });
+      return Promise.resolve({ state: "unknown", runtime, reason: "process_identity_unverifiable" });
     }
     if (owner.state === "held" && (owner.owner.pid !== runtime.pid || owner.owner.token !== runtime.ownerToken)) {
       return Promise.resolve({ state: "unknown", runtime, reason: "ownership_conflict" });
     }
+    if (owner.state === "held" && runtime.processIdentity !== undefined && owner.owner.processIdentity !== runtime.processIdentity) {
+      return Promise.resolve({ state: "unknown", runtime, reason: "process_identity_unverifiable" });
+    }
     if (owner.state === "free" && observePid(runtime.pid) !== "missing") {
-      return Promise.resolve({ state: "unknown", runtime, reason: "ownership_conflict" });
+      return Promise.resolve({ state: "unknown", runtime, reason: "process_identity_unverifiable" });
+    }
+    if (runtime.processIdentity !== undefined && observePid(runtime.pid) === "present" &&
+      processIdentityForPid(runtime.pid) !== runtime.processIdentity) {
+      return Promise.resolve({ state: "unknown", runtime, reason: "process_identity_unverifiable" });
     }
   }
   if (options.expectedInstallationId && runtime.installationId && runtime.installationId !== options.expectedInstallationId) {
@@ -257,7 +285,8 @@ function inspectRuntime(
     return Promise.resolve({ state: "unknown", runtime, reason: "build_mismatch" });
   }
 
-  return probeBridge(runtime.port).then((health) => {
+  const probe = options.probe ?? probeBridge;
+  return probe(runtime.port).then((health) => {
     if (health) {
       if (health.pid !== runtime.pid || health.port !== runtime.port) {
         return { state: "unknown", runtime, reason: "ownership_conflict" };
@@ -321,41 +350,37 @@ function inspectRuntime(
   });
 }
 
-async function missingInstallationObservation(): Promise<BridgeObservation> {
+async function missingInstallationObservation(options: ObservationOptions): Promise<BridgeObservation> {
   const owner = inspectStateLock(path.join(getStateDir(), "runtime", "installation-owner.lock"));
-  if (owner.state === "held" || owner.state === "unknown") {
+  if (owner.state === "held") {
     return { state: "unknown", runtime: null, reason: "ownership_conflict" };
   }
-  let lastPort: number | null = null;
+  if (owner.state === "unknown") {
+    return { state: "unknown", runtime: null, reason: "process_identity_unverifiable" };
+  }
+  let identity: ReturnType<typeof readInstallationIdentity>;
   try {
-    lastPort = readInstallationIdentity()?.lastPort ?? null;
+    identity = readInstallationIdentity();
   } catch {
-    return { state: "unknown", runtime: null, reason: "ownership_conflict" };
+    return { state: "unknown", runtime: null, reason: "corrupt_canonical_state" };
   }
-  // A deleted runtime file must not turn a listener on a previously-owned
-  // port into permission to start a second daemon. A first installation has
-  // no port hint and can still start normally.
-  const ports = [...new Set([lastPort, DEFAULT_PORT].filter((port): port is number => port !== null))];
+  // An explicitly isolated state directory is a separate test/installation
+  // boundary, so an unrelated daemon on the global default port must not make
+  // it look occupied. The normal state directory still probes the default;
+  // once this installation has a port hint, probe only that exact port.
+  const isolatedState = Boolean(process.env.C2C_STATE_DIR?.trim());
+  const ports = identity?.lastPort ? [identity.lastPort] : isolatedState ? [] : [DEFAULT_PORT];
+  const probe = options.probe ?? probeBridge;
   for (const port of ports) {
-    if (await probeBridge(port)) {
+    if (await probe(port)) {
       return { state: "unknown", runtime: null, reason: "runtime_missing_but_bridge_alive" };
     }
   }
   return { state: "stopped", runtime: null, reason: "runtime_missing" };
 }
 
-async function findLegacyObservation(
-  workspaceId: string | undefined,
-  options: ObservationOptions
-): Promise<BridgeObservation | null> {
-  for (const legacy of legacyRuntimeReads()) {
-    if (legacy.state === "corrupt") return inspectRuntime(legacy, workspaceId, options);
-    if (legacy.state === "valid") {
-      const observation = await inspectRuntime(legacy, workspaceId, options);
-      if (observation.state !== "stopped") return observation;
-    }
-  }
-  return null;
+function hasLegacyRuntimeState(): boolean {
+  return legacyRuntimeReads().some((read) => read.state !== "missing");
 }
 
 export async function findBridgeObservation(
@@ -364,9 +389,10 @@ export async function findBridgeObservation(
 ): Promise<BridgeObservation> {
   const installation = readInstallationRuntimeResult();
   if (installation.state !== "missing") return inspectRuntime(installation, workspaceId, options);
-  const legacy = readRuntimeFile(runtimeFile(workspaceId));
-  if (legacy.state !== "missing") return inspectRuntime(legacy, workspaceId, options);
-  return (await findLegacyObservation(workspaceId, options)) ?? missingInstallationObservation();
+  if (hasLegacyRuntimeState()) {
+    return { state: "unknown", runtime: null, reason: "unsupported_state_schema" };
+  }
+  return missingInstallationObservation(options);
 }
 
 export async function findInstallationObservation(
@@ -375,14 +401,20 @@ export async function findInstallationObservation(
 ): Promise<BridgeObservation> {
   const installation = readInstallationRuntimeResult();
   if (installation.state !== "missing") return inspectRuntime(installation, workspaceId, options);
-  return (await findLegacyObservation(workspaceId, options)) ?? missingInstallationObservation();
+  // Per-workspace runtime files are obsolete state, not a fallback source for
+  // installation lifecycle decisions. Keep them visible and fail closed so a
+  // reset cannot race an old daemon or accidentally start a second one.
+  if (hasLegacyRuntimeState()) {
+    return { state: "unknown", runtime: null, reason: "unsupported_state_schema" };
+  }
+  return missingInstallationObservation(options);
 }
 
 export async function findLiveBridge(
   workspaceId: string,
   options: ObservationOptions = {}
 ): Promise<RuntimeState | null> {
-  const observation = await findBridgeObservation(workspaceId, options);
+  const observation = await findInstallationObservation(workspaceId, options);
   return observation.state === "healthy" ? observation.runtime : null;
 }
 

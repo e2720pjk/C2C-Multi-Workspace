@@ -1,6 +1,7 @@
 import { describe, it, expect, afterEach, vi } from "vitest";
 import { EventEmitter } from "node:events";
 import fs from "node:fs";
+import path from "node:path";
 import type { ChildProcess } from "node:child_process";
 import { PassThrough } from "node:stream";
 import { findBinary } from "../src/tunnel/detect.js";
@@ -20,7 +21,16 @@ import {
   type CloudflaredAccount,
 } from "../src/tunnel/named-provision.js";
 import { resolveTunnelProtocol, tunnelProtocolArgs } from "../src/tunnel/protocol.js";
-import { isNamedTunnelReady, needsTunnelChoice, readTunnelState } from "../src/tunnel/state.js";
+import {
+  isNamedTunnelReady,
+  needsTunnelChoice,
+  obsoleteTunnelStateFile,
+  openAiRuntimeConfiguration,
+  readInstallationTunnelState,
+  readTunnelState,
+  selectTunnelProvider,
+  writeTunnelState,
+} from "../src/tunnel/state.js";
 import { cleanup, isolateStateDir, makeTmpDir, write } from "./helpers.js";
 
 const stateDirs: string[] = [];
@@ -292,6 +302,44 @@ ID                                   NAME          CREATED
 });
 
 describe("tunnel preference state", () => {
+  it("gives persisted provider choice precedence over ambient OpenAI variables", () => {
+    stateDirs.push(isolateStateDir());
+    const env = {
+      CONTROL_PLANE_TUNNEL_ID: "tunnel_0123456789abcdef0123456789abcdef",
+      CONTROL_PLANE_API_KEY: "runtime-secret",
+      C2C_TUNNEL_PROVIDER: "openai",
+    };
+    const obsolete = obsoleteTunnelStateFile("old-workspace-file-is-not-canonical");
+    fs.mkdirSync(path.dirname(obsolete), { recursive: true });
+    fs.writeFileSync(obsolete, JSON.stringify({
+      workspaceId: "old-workspace-file-is-not-canonical",
+      preference: "openai",
+      provider: "openai-secure",
+      tunnelId: env.CONTROL_PLANE_TUNNEL_ID,
+      askedAt: new Date().toISOString(),
+    }));
+    expect(readInstallationTunnelState().preference).toBe("unset");
+    expect(selectTunnelProvider(readInstallationTunnelState(), {}).provider).toBe("cloudflare-quick");
+    writeTunnelState({
+      workspaceId: "installation",
+      preference: "named",
+      provider: "cloudflare-named",
+      tunnelName: "c2c-demo",
+      hostname: "demo.example.com",
+      askedAt: new Date().toISOString(),
+    });
+    expect(selectTunnelProvider(readInstallationTunnelState(), env).provider).toBe("cloudflare-named");
+  });
+
+  it("does not auto-select OpenAI for incomplete runtime configuration", () => {
+    const state = { workspaceId: "installation", preference: "unset" as const };
+    expect(selectTunnelProvider(state, { CONTROL_PLANE_TUNNEL_ID: "tunnel_0123456789abcdef0123456789abcdef" })).toEqual({
+      provider: "cloudflare-quick",
+      diagnostic: expect.stringContaining("CONTROL_PLANE_API_KEY"),
+    });
+    expect(openAiRuntimeConfiguration({ CONTROL_PLANE_API_KEY: "runtime-secret" }).complete).toBe(false);
+  });
+
   it("asks once, then remembers a quick choice", () => {
     stateDirs.push(isolateStateDir());
     const unset = readTunnelState("ws1");
@@ -346,5 +394,28 @@ describe("tunnel preference state", () => {
       expect(result.state.preference).toBe("quick");
       expect(result.userMessage).toMatch(/临时地址/);
     });
+  });
+
+  it("can validate a named candidate without changing canonical state", async () => {
+    stateDirs.push(isolateStateDir());
+    const before = chooseQuickTunnel("installation");
+    const result = await provisionNamedTunnel({
+      workspaceId: "installation",
+      workspaceName: "Demo",
+      zone: "example.com",
+      persist: false,
+      account: {
+        hasCert: () => true,
+        login: async () => undefined,
+        listTunnels: async () => [],
+        createTunnel: async () => { throw new Error("candidate failed"); },
+        routeDns: async () => undefined,
+      },
+    });
+    expect(result.fallback).toBe(true);
+    const after = readInstallationTunnelState();
+    expect(after.preference).toBe(before.preference);
+    expect(after.provider).toBe(before.provider);
+    expect(after.fallbackReason).toBeUndefined();
   });
 });

@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import { spawn, type ChildProcess, type SpawnOptions } from "node:child_process";
 import {
   acquireStateLockAsync,
+  inspectStateLock,
   processIdentityForPid,
   processStateForPid,
   type StateLock,
@@ -46,6 +47,8 @@ export interface OpenAiSecureTunnelOptions {
   controlPlaneBaseUrl?: string;
   /** Optional short-lived bearer used for the local MCP binding. */
   mcpAuthorization?: () => TunnelAuthorization | Promise<TunnelAuthorization>;
+  /** Revoke the bearer when an unexpected child exit invalidates its channel. */
+  onAuthorizationInvalidated?: () => void;
 }
 
 function defaultReadyProbe(baseUrl: string): Promise<boolean> {
@@ -108,8 +111,8 @@ export class OpenAiSecureTunnel implements TunnelProvider {
   }
 
   private credentials(): { tunnelId: string; apiKey: string } {
-    const tunnelId = (this.options.tunnelId ?? process.env.CONTROL_PLANE_TUNNEL_ID ?? "").trim();
-    const apiKey = (this.options.apiKey ?? process.env.CONTROL_PLANE_API_KEY ?? "").trim();
+    const tunnelId = (this.options.tunnelId?.trim() || process.env.CONTROL_PLANE_TUNNEL_ID?.trim() || "").trim();
+    const apiKey = (this.options.apiKey?.trim() || process.env.CONTROL_PLANE_API_KEY?.trim() || "").trim();
     if (!tunnelId || !TUNNEL_ID_RE.test(tunnelId)) {
       throw new Error("NEED_OPENAI_TUNNEL_ID: set CONTROL_PLANE_TUNNEL_ID to an existing tunnel id.");
     }
@@ -120,7 +123,16 @@ export class OpenAiSecureTunnel implements TunnelProvider {
   }
 
   private binary(): string | null {
-    return this.options.binaryPath ?? this.options.binaryResolver?.() ?? findBinary("tunnel-client");
+    if (this.options.binaryPath !== undefined) {
+      try {
+        if (!fs.statSync(this.options.binaryPath).isFile()) return null;
+        fs.accessSync(this.options.binaryPath, fs.constants.F_OK | fs.constants.X_OK);
+        return this.options.binaryPath;
+      } catch {
+        return null;
+      }
+    }
+    return this.options.binaryResolver?.() ?? findBinary("tunnel-client");
   }
 
   private apiKeyDigest(apiKey: string): string {
@@ -149,8 +161,6 @@ export class OpenAiSecureTunnel implements TunnelProvider {
     ];
     if (withAuthorization) args.push("--mcp.extra-headers", "Authorization: env:C2C_MCP_AUTHORIZATION");
     args.push(
-      "--mcp.startup-wait-timeout",
-      "30s",
       "--health.listen-addr",
       "127.0.0.1:0",
       "--health.url-file",
@@ -170,7 +180,9 @@ export class OpenAiSecureTunnel implements TunnelProvider {
 
   private scheduleAuthorizationRefresh(expiresAt: number): void {
     if (this.authorizationTimer) clearTimeout(this.authorizationTimer);
-    const delay = Math.max(100, expiresAt - Date.now() - 30_000);
+    // Refresh before expiry even when a test or operator supplies a very
+    // short-lived token; a 100ms floor can otherwise refresh too late.
+    const delay = Math.max(10, expiresAt - Date.now() - 30_000);
     this.authorizationTimer = setTimeout(() => {
       this.authorizationTimer = null;
       if (this.stopping || this.localPort === null) return;
@@ -213,13 +225,16 @@ export class OpenAiSecureTunnel implements TunnelProvider {
   }
 
   private async reapSavedProcess(): Promise<void> {
+    if (!fs.existsSync(this.processStateFile)) return;
     let saved: SavedTunnelProcess | null;
     try {
       saved = readJsonStrict<SavedTunnelProcess>(this.processStateFile);
     } catch {
       throw new Error("OPENAI_TUNNEL_CONFLICT: tunnel-client process state is corrupt; refusing to start another client.");
     }
-    if (!saved) return;
+    if (!saved) {
+      throw new Error("OPENAI_TUNNEL_CONFLICT: tunnel-client process state is empty; refusing to start another client.");
+    }
     if (!Number.isInteger(saved.pid) || saved.pid <= 0 || !saved.processIdentity || !TUNNEL_ID_RE.test(saved.tunnelId)) {
       throw new Error("OPENAI_TUNNEL_CONFLICT: tunnel-client process state is invalid; refusing to start another client.");
     }
@@ -233,13 +248,35 @@ export class OpenAiSecureTunnel implements TunnelProvider {
     if (state === "present" && processIdentityForPid(saved.pid) !== saved.processIdentity) {
       throw new Error("OPENAI_TUNNEL_CONFLICT: tunnel-client PID was reused; refusing to terminate it.");
     }
+    const sameProcess = (): boolean => {
+      return processStateForPid(saved!.pid) === "present" && processIdentityForPid(saved!.pid) === saved!.processIdentity;
+    };
     if (state === "present") {
+      if (!sameProcess()) {
+        throw new Error("OPENAI_TUNNEL_CONFLICT: tunnel-client PID was reused; refusing to terminate it.");
+      }
       process.kill(saved.pid, "SIGTERM");
       const deadline = Date.now() + 3_000;
-      while (Date.now() < deadline && processStateForPid(saved.pid) === "present") {
+      while (Date.now() < deadline) {
+        const current = processStateForPid(saved.pid);
+        if (current === "missing") break;
+        const identity = processIdentityForPid(saved.pid);
+        if (identity && identity !== saved.processIdentity) {
+          throw new Error("OPENAI_TUNNEL_CONFLICT: tunnel-client PID changed while stopping it.");
+        }
+        // A terminating process can briefly lose inspectable identity before
+        // the kernel reports ESRCH. Wait; never turn that uncertainty into a kill.
         await new Promise((resolve) => setTimeout(resolve, 50));
       }
-      if (processStateForPid(saved.pid) === "present") process.kill(saved.pid, "SIGKILL");
+      if (sameProcess()) process.kill(saved.pid, "SIGKILL");
+      const killDeadline = Date.now() + 2_000;
+      while (Date.now() < killDeadline && processStateForPid(saved.pid) !== "missing") {
+        const identity = processIdentityForPid(saved.pid);
+        if (identity && identity !== saved.processIdentity) {
+          throw new Error("OPENAI_TUNNEL_CONFLICT: tunnel-client PID changed after SIGKILL.");
+        }
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
       if (processStateForPid(saved.pid) !== "missing") {
         throw new Error("OPENAI_TUNNEL_CONFLICT: previous tunnel-client did not stop safely.");
       }
@@ -268,7 +305,10 @@ export class OpenAiSecureTunnel implements TunnelProvider {
         if (this.authorizationTimer) clearTimeout(this.authorizationTimer);
         this.authorizationTimer = null;
         this.clearProcessState(child.pid);
-        if (!this.stopping && this.localPort !== null) this.scheduleRecovery(null, null);
+        if (!this.stopping) {
+          this.options.onAuthorizationInvalidated?.();
+          if (this.localPort !== null) this.scheduleRecovery(null, null);
+        }
       }
     });
     child.once("exit", (code, signal) => {
@@ -281,7 +321,10 @@ export class OpenAiSecureTunnel implements TunnelProvider {
       if (this.authorizationTimer) clearTimeout(this.authorizationTimer);
       this.authorizationTimer = null;
       this.clearProcessState(child.pid);
-      if (!this.stopping && this.localPort !== null) this.scheduleRecovery(code, signal);
+      if (!this.stopping) {
+        this.options.onAuthorizationInvalidated?.();
+        if (this.localPort !== null) this.scheduleRecovery(code, signal);
+      }
     });
   }
 
@@ -317,12 +360,14 @@ export class OpenAiSecureTunnel implements TunnelProvider {
     if (!binary) throw new Error("NEED_OPENAI_TUNNEL_CLIENT: official tunnel-client was not found on PATH.");
     const acquiredOwner = !this.ownerLock;
     if (acquiredOwner) this.ownerLock = await acquireStateLockAsync(this.lockPath, { timeoutMs: 250 });
+    let processStateHandled = !fs.existsSync(this.processStateFile);
 
     this.localPort = localPort;
     this.lastError = null;
     const healthUrlFile = path.join(this.healthDir, `health-${process.pid}-${Date.now()}.url`);
     try {
-      if (acquiredOwner) await this.reapSavedProcess();
+      await this.reapSavedProcess();
+      processStateHandled = true;
       fs.rmSync(healthUrlFile, { force: true });
       const childEnv = { ...process.env };
       // C2C starts an existing tunnel only; never hand an organization admin
@@ -368,7 +413,9 @@ export class OpenAiSecureTunnel implements TunnelProvider {
       this.activeAuthorizationDigest = null;
       if (this.authorizationTimer) clearTimeout(this.authorizationTimer);
       this.authorizationTimer = null;
-      this.clearProcessState();
+      // Preserve an unverifiable orphan record. Clearing it would let a later
+      // start overlap a PID we explicitly refused to terminate.
+      if (processStateHandled) this.clearProcessState();
       this.ownerLock?.release();
       this.ownerLock = null;
       throw error;
@@ -463,8 +510,20 @@ export class OpenAiSecureTunnel implements TunnelProvider {
     this.stopping = true;
     if (this.recoveryTimer) clearTimeout(this.recoveryTimer);
     this.recoveryTimer = null;
+    let adoptedOwner = false;
     try {
+      // A daemon can die after the child is spawned but before this provider
+      // instance is reconstructed. Adopt the verified owner lock and reap the
+      // recorded child instead of deleting its state and creating an overlap.
+      if (!this.child && fs.existsSync(this.processStateFile)) {
+        if (!this.ownerLock) {
+          this.ownerLock = await acquireStateLockAsync(this.lockPath, { timeoutMs: 250 });
+          adoptedOwner = true;
+        }
+        await this.reapSavedProcess();
+      }
       await this.stopChild();
+      this.clearProcessState();
       this.child = null;
       this.healthUrl = null;
       this.localPort = null;
@@ -477,6 +536,10 @@ export class OpenAiSecureTunnel implements TunnelProvider {
       this.ownerLock = null;
       this.stopping = false;
     } catch (error) {
+      if (adoptedOwner && !this.child) {
+        this.ownerLock?.release();
+        this.ownerLock = null;
+      }
       // Keep child/owner state intact: a replacement must not race a live client.
       this.stopping = false;
       throw error;
@@ -511,7 +574,13 @@ export class OpenAiSecureTunnel implements TunnelProvider {
       running: this.child !== null && this.healthUrl !== null,
       url: this.activeTunnelId ? this.connectorUrl(this.activeTunnelId) : null,
       provider: this.name,
-      detail: this.healthUrl ? `health=${this.healthUrl}` : this.lastError ?? undefined,
+      detail: this.healthUrl
+        ? `health=${this.healthUrl}`
+        : !this.child && fs.existsSync(this.processStateFile)
+          ? "OPENAI_TUNNEL_CONFLICT: previous tunnel-client state remains"
+          : this.child
+            ? "tunnel-client running but not ready"
+            : this.lastError ?? undefined,
     };
   }
 
@@ -528,9 +597,23 @@ export class OpenAiSecureTunnel implements TunnelProvider {
     } catch (error) {
       problems.push((error as Error).message.split(":")[0]);
     }
-    if (!binaryPath) problems.push("official tunnel-client binary not found");
-    if (credentials && this.child === null) problems.push("tunnel-client process not running");
+    if (!binaryPath) problems.push("NEED_OPENAI_TUNNEL_CLIENT: official tunnel-client binary not found");
+    if (!credentials) {
+      const tunnelId = (this.options.tunnelId?.trim() || process.env.CONTROL_PLANE_TUNNEL_ID?.trim() || "").trim();
+      const apiKey = (this.options.apiKey?.trim() || process.env.CONTROL_PLANE_API_KEY?.trim() || "").trim();
+      if (!tunnelId || !TUNNEL_ID_RE.test(tunnelId)) {
+        problems.push("NEED_OPENAI_TUNNEL_ID: CONTROL_PLANE_TUNNEL_ID is missing or invalid");
+      }
+      if (!apiKey) problems.push("NEED_OPENAI_TUNNEL_KEY: CONTROL_PLANE_API_KEY is missing");
+    }
+    const owner = inspectStateLock(this.lockPath);
+    if (!this.child && owner.state === "held") problems.push("OPENAI_TUNNEL_CONFLICT: tunnel owner lock is held");
+    if (!this.child && owner.state === "unknown") problems.push(`OPENAI_TUNNEL_CONFLICT: ${owner.reason}`);
+    if (credentials && this.child === null && owner.state === "free") problems.push("tunnel-client process not running");
     if (this.child && !this.healthUrl) problems.push("tunnel-client running but not ready");
+    if (!this.child && fs.existsSync(this.processStateFile)) {
+      problems.push("OPENAI_TUNNEL_CONFLICT: previous tunnel-client state remains");
+    }
     return {
       provider: this.name,
       binaryFound: binaryPath !== null,

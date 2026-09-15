@@ -166,7 +166,7 @@ export class CloudflaredNamedTunnel implements TunnelProvider {
       running: this.child !== null && this.connected,
       url: this.connected ? this.publicUrl() : null,
       provider: this.name,
-      detail: this.lastError ?? undefined,
+      detail: this.lastError ?? (this.child ? "named tunnel running but not connected yet" : undefined),
     };
   }
 

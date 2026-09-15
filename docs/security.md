@@ -41,16 +41,18 @@ Scopes: `workspace.read`, `workspace.search`, `git.read`, `execution.read`,
 `offline_access`. Tools enforce scopes individually (`INSUFFICIENT_SCOPE`).
 Access tokens: 1 hour. Refresh tokens: 30 days, rotated. Multi-workspace
 installation tokens are bound to the installation and `client_id`; the selected
-workspace is still required to be in the registered, enabled allowlist. Legacy
-single-workspace token files remain readable for compatibility.
+workspace is still required to be in the registered, enabled allowlist. The
+installation OAuth store is canonical; no legacy tunnel or workspace-state
+migration is attempted.
 
 ## Storage
 
 State lives under the OS-convention app dir
 (`~/Library/Application Support/codex-with-chatgpt` on macOS), directories 0700,
 files 0600. The registered workspace collection/default, installation OAuth,
-runtime, endpoint, and tunnel metadata live there — never in a project. Legacy
-per-workspace tunnel/auth files are migration inputs. Only SHA-256 hashes of
+runtime, endpoint, and tunnel metadata live there — never in a project. Only
+canonical installation state is read by the lifecycle; obsolete state fails
+closed or is ignored when it is outside the active source of truth. Only SHA-256 hashes of
 tokens are persisted — a stolen state file does not yield usable bearer tokens.
 
 **V1 limitation**: client registrations and token hashes are file-based rather

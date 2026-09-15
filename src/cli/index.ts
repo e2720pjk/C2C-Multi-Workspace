@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 import { startBridge } from "../bridge/server.js";
 import { findInstallationObservation, type RuntimeState } from "../bridge/runtime.js";
 import { readInstallationIdentity } from "../config/installation.js";
-import { adminFetch, ensureBridge, stopBridge } from "../process/daemon.js";
+import { adminFetch, ensureBridge, stopBridge, withInstallationStartupLock } from "../process/daemon.js";
 import { Workspace } from "../workspace/manager.js";
 import { INSTALLATION_WORKSPACE_ID, WorkspaceRegistry } from "../workspace/registry.js";
 import { AuthStore } from "../auth/store.js";
@@ -23,9 +23,12 @@ import {
   NAMED_LOGIN_PROMPT,
   NAMED_REPAIR_MESSAGE,
   needsTunnelChoice,
+  openAiRuntimeConfiguration,
   readInstallationTunnelState,
+  selectTunnelProvider,
   writeTunnelState,
   TUNNEL_CHOICE_PROMPT,
+  type TunnelState,
 } from "../tunnel/state.js";
 import { Logger } from "../logger/index.js";
 import { getStateDir } from "../config/paths.js";
@@ -94,8 +97,60 @@ function runtimeCompatibility(): {
 
 const INSTALLATION_ENDPOINT_ID = INSTALLATION_WORKSPACE_ID;
 
-function previousInstallationEndpoint(workspaceId: string): LastEndpoint | null {
-  return readLastEndpoint(INSTALLATION_ENDPOINT_ID) ?? readLastEndpoint(workspaceId);
+function tunnelStateConfiguration(state: TunnelState): string {
+  return JSON.stringify({
+    preference: state.preference,
+    provider: state.provider,
+    tunnelId: state.tunnelId,
+    tunnelName: state.tunnelName,
+    hostname: state.hostname,
+    zone: state.zone,
+  });
+}
+
+function validateOpenAiChoice(): string {
+  const config = openAiRuntimeConfiguration(process.env);
+  if (!config.complete || !config.tunnelId) {
+    throw new Error(`INCOMPLETE_OPENAI_CONFIGURATION: missing ${config.missing.join(" and ")}`);
+  }
+  if (!detectTunnelBinaries().tunnelClient) {
+    throw new Error("NEED_OPENAI_TUNNEL_CLIENT: official tunnel-client is not installed or not on PATH.");
+  }
+  return config.tunnelId;
+}
+
+/** Commit a provider choice while holding the same lock used by daemon startup. */
+async function commitTunnelChoice(target: TunnelState, preserveHealthyOnFailure = false): Promise<TunnelState> {
+  return withInstallationStartupLock(async (startupLock) => {
+    const current = readInstallationTunnelState();
+    const observation = await findInstallationObservation(undefined, runtimeCompatibility());
+    if (observation.state === "unknown") {
+      if (observation.reason === "build_mismatch" && observation.runtime) {
+        if (preserveHealthyOnFailure) return current;
+        await stopBridge(undefined, startupLock);
+      } else {
+        throw new Error(`Bridge state is uncertain (${observation.reason}); refusing to change tunnel state.`);
+      }
+    } else if (observation.state === "healthy") {
+      const info = await adminFetch<{ tunnel: { provider: string } }>(observation.runtime, "GET", "/admin/info");
+      const currentProvider = selectTunnelProvider(current).provider;
+      if (info.tunnel.provider !== currentProvider) {
+        throw new Error("Running provider does not match canonical tunnel state; refusing to replace it.");
+      }
+      if (preserveHealthyOnFailure) return current;
+      if (
+        info.tunnel.provider !== target.provider ||
+        tunnelStateConfiguration(current) !== tunnelStateConfiguration(target)
+      ) {
+        await stopBridge(undefined, startupLock);
+      }
+    }
+    return writeTunnelState(target);
+  });
+}
+
+function previousInstallationEndpoint(_workspaceId: string): LastEndpoint | null {
+  return readLastEndpoint(INSTALLATION_ENDPOINT_ID);
 }
 
 function parseInteger(value: string): number {
@@ -171,24 +226,26 @@ function persistWorkspaceEndpoint(opts: {
 }
 
 function tunnelChoicePayload(workspace: Workspace, zoneHint?: string): Record<string, unknown> {
-  const state = readInstallationTunnelState(workspace.id);
+  const state = readInstallationTunnelState();
   const binaries = detectTunnelBinaries();
-  const openaiConfigured = Boolean(process.env.CONTROL_PLANE_TUNNEL_ID && process.env.CONTROL_PLANE_API_KEY);
-  const openaiSelected = state.preference === "openai" || (state.preference === "unset" && openaiConfigured);
+  const selection = selectTunnelProvider(state);
+  const openaiConfig = openAiRuntimeConfiguration(process.env, state.tunnelId);
+  const openaiSelected = selection.provider === "openai-secure";
   const zone = parseZoneInput(zoneHint ?? "") ?? state.zone ?? null;
   return {
     ok: true,
-    needsChoice: needsTunnelChoice(state) && !openaiConfigured,
+    needsChoice: needsTunnelChoice(state) && !openaiSelected,
     preference: openaiSelected ? "openai" : state.preference,
-    provider: openaiSelected ? "openai-secure" : state.provider ?? null,
+    provider: selection.provider,
     loggedIn: hasCloudflaredCert(),
-    openaiConfigured,
+    openaiConfigured: openaiConfig.complete,
+    openaiDiagnostic: selection.diagnostic,
     tunnelClientFound: binaries.tunnelClient !== null,
     namedReady: isNamedTunnelReady(state),
     zone,
     hostname: state.hostname ?? null,
     suggestedHostname: zone ? suggestedNamedHostname(zone, PRODUCT_NAME, INSTALLATION_ENDPOINT_ID) : null,
-    userPrompt: needsTunnelChoice(state) && !openaiConfigured ? TUNNEL_CHOICE_PROMPT : undefined,
+    userPrompt: needsTunnelChoice(state) && !openaiSelected ? TUNNEL_CHOICE_PROMPT : undefined,
     loginPrompt: NAMED_LOGIN_PROMPT,
     fallbackReason: state.fallbackReason,
   };
@@ -230,7 +287,7 @@ interface AdminInfo {
   workspaces?: Array<Record<string, unknown>>;
   port: number;
   publicUrl: string | null;
-  tunnel: { running: boolean; url: string | null; provider: string };
+  tunnel: { running: boolean; url: string | null; provider: string; detail?: string };
   tokenCount: number;
   pairingActive: boolean;
   pid: number;
@@ -246,6 +303,8 @@ async function ensureBridgeAndTunnel(
   let info = await adminFetch<AdminInfo>(runtime, "GET", "/admin/info");
   let mcpUrl: string | null = mcpUrlForTunnel(info);
   if (opts.tunnel && !info.tunnel.running) {
+    const selection = selectTunnelProvider(readInstallationTunnelState());
+    if (selection.diagnostic) throw new Error(selection.diagnostic);
     const binaries = detectTunnelBinaries();
     if (info.tunnel.provider === "openai-secure") {
       if (!binaries.tunnelClient) {
@@ -366,7 +425,7 @@ program
             hadEndpointBefore: Boolean(previousInstallationEndpoint(info.workspaceId)),
           });
       const pairingResult = await adminFetch<PairingResponse>(runtime, "POST", "/admin/pairing");
-      const tunnelState = readInstallationTunnelState(targetWorkspace.id);
+      const tunnelState = readInstallationTunnelState();
       if (opts.json) {
         say(
           JSON.stringify({
@@ -456,9 +515,17 @@ program
             running: null,
             compatible: false,
             state: "unknown",
+            lifecycleState: observation.reason,
+            diagnosticCode: observation.reason,
             reason: observation.reason,
             expectedContractId: RUNTIME_CONTRACT_ID,
             expectedBuildId: RUNTIME_BUILD_ID,
+            recovery:
+              observation.reason === "unsupported_state_schema" ||
+              observation.reason === "runtime_corrupt" ||
+              observation.reason === "corrupt_canonical_state"
+                ? "After confirming no previous C2C daemon or tunnel-client is running, reset local C2C state and run setup again."
+                : undefined,
           })
         );
       } else {
@@ -467,11 +534,47 @@ program
       return;
     }
     if (observation.state === "stopped") {
-      const registry = new WorkspaceRegistry();
+      let registry: WorkspaceRegistry;
+      try {
+        registry = new WorkspaceRegistry();
+      } catch (error) {
+        const corrupt = {
+          ok: false,
+          running: false,
+          compatible: false,
+          state: "corrupt_canonical_state",
+          reason: (error as Error).message,
+          recovery: "After confirming no previous C2C daemon or tunnel-client is running, reset local C2C state and run setup again.",
+        };
+        if (opts.json) say(JSON.stringify(corrupt));
+        else cross(`C2C canonical state 无法读取：${corrupt.reason}`);
+        return;
+      }
       const registered = registry.summaries().find((item) => item.workspaceId === workspace.id);
+      let stoppedTunnelDiagnostic: string | undefined;
+      let stoppedTunnelProvider: string | undefined;
+      try {
+        const tunnelState = readInstallationTunnelState();
+        const selection = selectTunnelProvider(tunnelState);
+        stoppedTunnelProvider = selection.provider;
+        const config = openAiRuntimeConfiguration(process.env, tunnelState.tunnelId);
+        const binaries = detectTunnelBinaries();
+        stoppedTunnelDiagnostic = selection.diagnostic ??
+          (selection.provider === "openai-secure" && !config.complete
+            ? `OPENAI_CONFIGURATION_INCOMPLETE: missing ${config.missing.join(" and ")}`
+            : selection.provider === "openai-secure" && !binaries.tunnelClient
+              ? "NEED_OPENAI_TUNNEL_CLIENT"
+              : selection.provider.startsWith("cloudflare") && !binaries.cloudflared
+                ? "NEED_CLOUDFLARED"
+                : undefined);
+      } catch (error) {
+        stoppedTunnelDiagnostic = (error as Error).message;
+      }
       const stopped = {
         ok: false,
         running: false,
+        tunnelProvider: stoppedTunnelProvider,
+        tunnelDiagnostic: stoppedTunnelDiagnostic,
         currentWorkspace: {
           workspaceId: workspace.id,
           displayName: workspace.name,
@@ -480,6 +583,8 @@ program
           available: registered?.available ?? true,
         },
         registeredWorkspaceCount: registry.list().length,
+        state: "stopped",
+        reason: observation.reason,
       };
       if (opts.json) say(JSON.stringify(stopped));
       else {
@@ -489,12 +594,48 @@ program
       return;
     }
     const runtime = observation.runtime;
-    const info = await adminFetch<AdminInfo>(runtime, "GET", "/admin/info");
+    let info: AdminInfo;
+    try {
+      info = await adminFetch<AdminInfo>(runtime, "GET", "/admin/info");
+    } catch (error) {
+      const diagnostic = {
+        ok: false,
+        running: null,
+        compatible: false,
+        state: "ownership_conflict",
+        reason: `admin_authority_unverified: ${(error as Error).message}`,
+      };
+      if (opts.json) say(JSON.stringify(diagnostic));
+      else cross(`Bridge 管理权限无法验证：${diagnostic.reason}`);
+      return;
+    }
     const currentWorkspace = info.workspaces?.find((item) => item.workspaceId === workspace.id) ?? null;
+    let tunnelDiagnostic: string | undefined;
+    try {
+      const tunnelState = readInstallationTunnelState();
+      const selection = selectTunnelProvider(tunnelState);
+      const openAiConfig = openAiRuntimeConfiguration(process.env, tunnelState.tunnelId);
+      const binaries = detectTunnelBinaries();
+      tunnelDiagnostic = selection.diagnostic ??
+        (!info.tunnel.running && info.tunnel.detail
+          ? info.tunnel.detail
+          : selection.provider === "openai-secure" && !openAiConfig.complete
+            ? `OPENAI_CONFIGURATION_INCOMPLETE: missing ${openAiConfig.missing.join(" and ")}`
+            : selection.provider === "openai-secure" && !binaries.tunnelClient
+              ? "NEED_OPENAI_TUNNEL_CLIENT"
+              : selection.provider.startsWith("cloudflare") && !binaries.cloudflared
+                ? "NEED_CLOUDFLARED"
+                : undefined);
+    } catch (error) {
+      tunnelDiagnostic = (error as Error).message;
+    }
     const status = {
       ok: true,
       running: true,
       compatible: true,
+      state: "healthy",
+      lifecycleState: "healthy",
+      tunnelDiagnostic,
       currentWorkspace: {
         workspaceId: workspace.id,
         displayName: workspace.name,
@@ -559,7 +700,12 @@ program
     let workspace: Workspace | null = null;
     try {
       workspace = new Workspace(root);
-      report.workspace = { ok: true, detail: workspace.name };
+      try {
+        new WorkspaceRegistry().list();
+        report.workspace = { ok: true, detail: workspace.name };
+      } catch (error) {
+        report.workspace = { ok: false, detail: `canonical registry unavailable: ${(error as Error).message}` };
+      }
     } catch (error) {
       report.workspace = { ok: false, detail: (error as Error).message };
     }
@@ -613,7 +759,20 @@ program
           hadEndpointBefore: Boolean(lastEndpoint),
         })
       : PRODUCT_NAME;
-    const tunnelState = workspace ? readInstallationTunnelState(workspace.id) : null;
+    let tunnelState: ReturnType<typeof readInstallationTunnelState> | null = null;
+    let tunnelStateError: string | null = null;
+    if (workspace) {
+      try {
+        tunnelState = readInstallationTunnelState();
+      } catch (error) {
+        tunnelStateError = (error as Error).message;
+      }
+    }
+    const tunnelSelection = tunnelState ? selectTunnelProvider(tunnelState) : null;
+    const openAiConfig = tunnelState
+      ? openAiRuntimeConfiguration(process.env, tunnelState.tunnelId)
+      : null;
+    const tunnelBinaries = detectTunnelBinaries();
     const namedReady = tunnelState ? isNamedTunnelReady(tunnelState) : false;
     let namedRepair: { needed: boolean; userMessage?: string } = { needed: false };
     let chatgptRepair: {
@@ -644,8 +803,22 @@ program
       },
     };
 
-    if (runtime) {
-      let info = await adminFetch<AdminInfo>(runtime, "GET", "/admin/info");
+    if (tunnelStateError) {
+      report.tunnel = { ok: false, detail: tunnelStateError };
+    } else if (runtime) {
+      let info: AdminInfo | null;
+      try {
+        info = await adminFetch<AdminInfo>(runtime, "GET", "/admin/info");
+      } catch (error) {
+        const detail = `admin_authority_unverified: ${(error as Error).message}`;
+        report.bridge = { ok: false, detail };
+        report.mcp = { ok: false, detail };
+        report.oauth = { ok: false, detail };
+        report.tunnel = { ok: false, detail: "Bridge admin authority unavailable; tunnel diagnosis skipped" };
+        bridgeUnknown = true;
+        info = null;
+      }
+      if (info) {
       if (namedReady && opts.fix && info.tunnel.provider !== "cloudflare-named") {
         await stopBridge();
         await new Promise((resolve) => setTimeout(resolve, 400));
@@ -659,6 +832,20 @@ program
       }
       const openAiTunnel = info.tunnel.provider === "openai-secure";
       const expectedPublic = Boolean(lastEndpoint?.publicUrl) || namedReady || openAiTunnel;
+      const binaries = tunnelBinaries;
+      const providerProblems = openAiTunnel
+        ? [
+            ...(openAiConfig && !openAiConfig.tunnelId ? ["NEED_OPENAI_TUNNEL_ID"] : []),
+            ...(openAiConfig && !openAiConfig.apiKeyPresent ? ["NEED_OPENAI_TUNNEL_KEY"] : []),
+            ...(!binaries.tunnelClient ? ["NEED_OPENAI_TUNNEL_CLIENT"] : []),
+          ]
+        : info.tunnel.provider === "cloudflare-quick" || info.tunnel.provider === "cloudflare-named"
+          ? [...(!binaries.cloudflared ? ["NEED_CLOUDFLARED"] : [])]
+          : [];
+      const providerRequired = Boolean(tunnelState?.preference && tunnelState.preference !== "unset") || expectedPublic;
+      if (providerRequired && providerProblems.length > 0 && !info.tunnel.running) {
+        report.tunnel = { ok: false, detail: providerProblems.join(", ") };
+      }
       let currentUrl = info.publicUrl ?? info.tunnel.url;
       let healthy = openAiTunnel ? info.tunnel.running : false;
       if (currentUrl && !openAiTunnel) {
@@ -670,23 +857,17 @@ program
         }
       }
 
-      if ((!currentUrl || !healthy) && opts.fix && (expectedPublic || info.tunnel.running)) {
+      if ((!currentUrl || !healthy) && opts.fix && (expectedPublic || info.tunnel.running) && providerProblems.length === 0) {
         try {
-          const binaries = detectTunnelBinaries();
-          const missing = openAiTunnel ? !binaries.tunnelClient : !binaries.cloudflared;
-          if (missing) {
-            report.tunnel = { ok: false, detail: openAiTunnel ? "NEED_OPENAI_TUNNEL_CLIENT" : "NEED_CLOUDFLARED" };
-          } else {
-            const started = await adminFetch<TunnelStartResponse>(runtime, "POST", "/admin/tunnel/start", 90_000);
-            if (started.url) {
-              const previousUrl = lastEndpoint?.publicUrl;
-              info = await adminFetch<AdminInfo>(runtime, "GET", "/admin/info");
-              currentUrl = info.publicUrl ?? started.url;
-              healthy = openAiTunnel ? info.tunnel.running : true;
-              const sameAddress =
-                previousUrl && normalizePublicUrl(previousUrl) === normalizePublicUrl(currentUrl);
-              results.push(sameAddress ? "已重新建立安全连接" : "已重新建立安全连接（地址已更换）");
-            }
+          const started = await adminFetch<TunnelStartResponse>(runtime, "POST", "/admin/tunnel/start", 90_000);
+          if (started.url) {
+            const previousUrl = lastEndpoint?.publicUrl;
+            info = await adminFetch<AdminInfo>(runtime, "GET", "/admin/info");
+            currentUrl = info.publicUrl ?? started.url;
+            healthy = openAiTunnel ? info.tunnel.running : true;
+            const sameAddress =
+              previousUrl && normalizePublicUrl(previousUrl) === normalizePublicUrl(currentUrl);
+            results.push(sameAddress ? "已重新建立安全连接" : "已重新建立安全连接（地址已更换）");
           }
         } catch (error) {
           report.tunnel = { ok: false, detail: (error as Error).message };
@@ -724,7 +905,7 @@ program
         report.tunnel = report.tunnel ?? { ok: false, detail: "NAMED_TUNNEL_DOWN" };
         namedRepair = { needed: true, userMessage: NAMED_REPAIR_MESSAGE };
       } else if (expectedPublic) {
-        report.tunnel = report.tunnel ?? { ok: false, detail: "安全连接未恢复" };
+        report.tunnel = report.tunnel ?? { ok: false, detail: info.tunnel.detail ?? "安全连接未恢复" };
         chatgptRepair = {
           ...chatgptRepair,
           needed: true,
@@ -738,6 +919,7 @@ program
         report.tunnel = { ok: true, detail: "未启用（本地模式）" };
       } else {
         report.tunnel = { ok: false, detail: "公网地址无法访问" };
+      }
       }
     } else if (bridgeUnknown) {
       report.tunnel = report.tunnel ?? { ok: false, detail: "Bridge 状态无法确认，未执行连接器修复" };
@@ -754,6 +936,28 @@ program
         connectorName,
         userMessage: reclaimUserMessage(connectorName),
       };
+    }
+
+    if (tunnelSelection?.diagnostic) {
+      report.tunnel = { ok: false, detail: tunnelSelection.diagnostic };
+    } else if (tunnelSelection?.provider === "openai-secure" && openAiConfig && !openAiConfig.complete) {
+      report.tunnel = {
+        ok: false,
+        detail: `OPENAI_CONFIGURATION_INCOMPLETE: missing ${openAiConfig.missing.join(" and ")}`,
+      };
+    } else if (
+      tunnelSelection?.provider === "openai-secure" &&
+      (tunnelState?.preference === "openai" || openAiConfig?.complete) &&
+      !tunnelBinaries.tunnelClient
+    ) {
+      report.tunnel = { ok: false, detail: "NEED_OPENAI_TUNNEL_CLIENT" };
+    } else if (
+      tunnelSelection &&
+      tunnelSelection.provider.startsWith("cloudflare") &&
+      tunnelState?.preference !== "unset" &&
+      !tunnelBinaries.cloudflared
+    ) {
+      report.tunnel = { ok: false, detail: "NEED_CLOUDFLARED" };
     }
 
     if (opts.json) {
@@ -1349,32 +1553,25 @@ tunnelCmd
     try {
       const workspace = new Workspace(root);
       const mode = opts.mode.trim().toLowerCase();
-      const previous = readInstallationTunnelState(workspace.id);
       if (mode === "quick") {
-        const state = chooseQuickTunnel(INSTALLATION_ENDPOINT_ID);
-        if ((await findInstallationObservation(undefined, runtimeCompatibility())).state === "healthy") {
-          if (previous.preference !== "quick") await stopBridge();
-        }
+        const candidate = chooseQuickTunnel(INSTALLATION_ENDPOINT_ID, undefined, false);
+        const state = await commitTunnelChoice(candidate);
         const payload = { ...tunnelChoicePayload(workspace), state };
         if (opts.json) say(JSON.stringify(payload));
         else check("已选用临时地址");
         return;
       }
       if (mode === "openai") {
-        if (!process.env.CONTROL_PLANE_TUNNEL_ID || !process.env.CONTROL_PLANE_API_KEY) {
-          throw new Error("OpenAI Secure Tunnel requires CONTROL_PLANE_TUNNEL_ID and CONTROL_PLANE_API_KEY.");
-        }
-        const state = writeTunnelState({
+        const tunnelId = validateOpenAiChoice();
+        const candidate: TunnelState = {
           workspaceId: INSTALLATION_ENDPOINT_ID,
           preference: "openai",
           provider: "openai-secure",
-          tunnelId: process.env.CONTROL_PLANE_TUNNEL_ID,
+          tunnelId,
           askedAt: new Date().toISOString(),
           configuredAt: new Date().toISOString(),
-        });
-        if ((await findInstallationObservation(undefined, runtimeCompatibility())).state === "healthy") {
-          await stopBridge();
-        }
+        };
+        const state = await commitTunnelChoice(candidate);
         const payload = { ...tunnelChoicePayload(workspace), state };
         if (opts.json) say(JSON.stringify(payload));
         else check("已选用 OpenAI Secure Tunnel");
@@ -1404,17 +1601,16 @@ tunnelCmd
         workspaceName: PRODUCT_NAME,
         zone,
         hostname: opts.hostname,
+        persist: false,
       });
-      if ((await findInstallationObservation(undefined, runtimeCompatibility())).state === "healthy") {
-        await stopBridge();
-      }
+      const state = await commitTunnelChoice(result.state, result.fallback);
       const payload = {
         ...tunnelChoicePayload(workspace),
         ok: true,
         fallback: result.fallback,
         userMessage: result.userMessage,
         error: result.error,
-        state: result.state,
+        state,
       };
       if (opts.json) {
         say(JSON.stringify(payload));

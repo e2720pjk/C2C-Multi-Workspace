@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { findInstallationObservation, writeRuntimeState } from "../src/bridge/runtime.js";
+import { startBridge } from "../src/bridge/server.js";
 import { acquireStateLock, inspectStateLock } from "../src/config/lock.js";
 import { ensureInstallationIdentity } from "../src/config/installation.js";
 import { ensureBridge, stopBridge } from "../src/process/daemon.js";
@@ -11,12 +12,16 @@ import { Workspace } from "../src/workspace/manager.js";
 import { workspaceRegistryFile, WorkspaceRegistry } from "../src/workspace/registry.js";
 import { cleanup, isolateStateDir, makeTmpDir, write } from "./helpers.js";
 
-function runCliStart(root: string, state: string): Promise<{ code: number | null; stdout: string; stderr: string }> {
+function runCli(
+  args: string[],
+  state: string,
+  env: NodeJS.ProcessEnv = {}
+): Promise<{ code: number | null; stdout: string; stderr: string }> {
   return new Promise((resolve) => {
     const child = spawn(
       process.execPath,
-      ["--import", "tsx/esm", path.join(process.cwd(), "src", "cli", "index.ts"), "start", "--workspace", root, "--json"],
-      { env: { ...process.env, C2C_STATE_DIR: state }, stdio: ["ignore", "pipe", "pipe"] }
+      ["--import", "tsx/esm", path.join(process.cwd(), "src", "cli", "index.ts"), ...args],
+      { env: { ...process.env, ...env, C2C_STATE_DIR: state }, stdio: ["ignore", "pipe", "pipe"] }
     );
     let stdout = "";
     let stderr = "";
@@ -24,6 +29,10 @@ function runCliStart(root: string, state: string): Promise<{ code: number | null
     child.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
     child.once("close", (code) => resolve({ code, stdout, stderr }));
   });
+}
+
+function runCliStart(root: string, state: string): Promise<{ code: number | null; stdout: string; stderr: string }> {
+  return runCli(["start", "--workspace", root, "--json"], state);
 }
 
 function baseRuntime(root: string) {
@@ -99,6 +108,59 @@ describe("installation lifecycle ownership", () => {
     fs.mkdirSync(path.dirname(file), { recursive: true });
     fs.writeFileSync(file, "{broken", { mode: 0o600 });
     expect(() => new WorkspaceRegistry()).toThrow(/registry is not valid JSON/i);
+  });
+
+  it("gracefully replaces an owned daemon from an incompatible build", async () => {
+    const state = isolateStateDir();
+    const root = makeTmpDir("lifecycle-upgrade");
+    dirs.push(state, root);
+    write(root, "a.txt", "a");
+    const old = await startBridge({
+      workspaceRoot: root,
+      port: 0,
+      persistRuntime: true,
+      runtimeBuildId: "c2c-build-test-a",
+      exitOnShutdown: false,
+    });
+    const replacement = await ensureBridge(root);
+    try {
+      expect(replacement.spawned).toBe(true);
+      expect(replacement.runtime.buildId).toBe(RUNTIME_BUILD_ID);
+      expect(replacement.runtime.port).toBeGreaterThan(0);
+      expect(replacement.runtime.pid).not.toBe(process.pid);
+      expect((await findInstallationObservation(undefined, {
+        expectedInstallationId: old.installationId,
+        expectedContractId: RUNTIME_CONTRACT_ID,
+        expectedBuildId: RUNTIME_BUILD_ID,
+      })).state).toBe("healthy");
+    } finally {
+      await stopBridge();
+      await old.close();
+    }
+  });
+
+  it("does not stop a healthy daemon for an invalid OpenAI candidate", async () => {
+    const state = isolateStateDir();
+    const root = makeTmpDir("lifecycle-invalid-provider");
+    dirs.push(state, root);
+    write(root, "a.txt", "a");
+    const bridge = await startBridge({ workspaceRoot: root, port: 0, persistRuntime: true, exitOnShutdown: false });
+    try {
+      const result = await runCli(
+        ["tunnel", "choose", "--mode", "openai", "--json"],
+        state,
+        { CONTROL_PLANE_TUNNEL_ID: "tunnel_0123456789abcdef0123456789abcdef", CONTROL_PLANE_API_KEY: "" }
+      );
+      expect(result.code).toBe(1);
+      expect(result.stdout).toMatch(/INCOMPLETE_OPENAI_CONFIGURATION/);
+      expect((await findInstallationObservation(undefined, {
+        expectedInstallationId: bridge.installationId,
+        expectedContractId: RUNTIME_CONTRACT_ID,
+        expectedBuildId: RUNTIME_BUILD_ID,
+      })).state).toBe("healthy");
+    } finally {
+      await bridge.close();
+    }
   });
 
   it("does not classify a mismatched runtime contract as reusable", async () => {

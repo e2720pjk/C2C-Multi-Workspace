@@ -63,8 +63,7 @@ A registration stores:
 - `enabled`, registration timestamps, and the installation default id.
 
 Because the id is derived from the canonical root, two worktrees of one
-repository have different ids and remain independent routing targets. Alias collisions are rejected during registration. A malformed legacy state with
-colliding aliases fails closed and must be repaired locally before routing.
+repository have different ids and remain independent routing targets. Alias comparisons use Unicode NFKC, trimming, and case folding; collisions fail closed during registration and persisted-state validation.
 
 A workspace-relative path is still canonicalized and checked against the
 selected registered root. `..`, absolute escapes, canonical symlink escapes,
@@ -100,7 +99,10 @@ because the preferred port is occupied.
 
 `status`, `stop`, and `restart` distinguish `healthy`, `stopped`, and
 `unknown/conflicting`. Corrupt state, a failed health probe, an unverifiable
-PID, or a contract/build mismatch is reported and fails closed; lifecycle code
+PID, or a contract mismatch is reported and fails closed. A build mismatch is
+not reusable, but an owner-lease, health, and authenticated-admin proof lets
+`start`/`stop` gracefully shut down that same-installation daemon before
+replacement; lifecycle code
 does not kill a PID it cannot attribute to this installation.
 
 The registry and installation identity use owner-only, atomically replaced JSON
@@ -114,8 +116,7 @@ workspace does not create another Connector. The one tunnel provider is owned
 by the bridge process and forwards to the same local MCP port. Requests for A
 and B can run concurrently, and no routing path calls tunnel start/restart.
 
-Older per-workspace tunnel and endpoint state is read as a migration fallback;
-new installation state is written under the installation identity. This checkout also supports the official OpenAI Secure Tunnel client when
+Tunnel and endpoint state is installation-owned; obsolete per-workspace tunnel state is not read. This checkout also supports the official OpenAI Secure Tunnel client when
 `CONTROL_PLANE_TUNNEL_ID` and `CONTROL_PLANE_API_KEY` are set. C2C starts one
 installation-owned `tunnel-client` process and uses the connector URL
 `<CONTROL_PLANE_BASE_URL>/v1/mcp/<tunnel_id>` (default base:

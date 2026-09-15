@@ -1,7 +1,7 @@
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { ensureDir, getStateDir, readJsonIfExists, writeSecureJson } from "../config/paths.js";
+import { ensureDir, getStateDir, readJsonStrict, writeSecureJson } from "../config/paths.js";
 
 export const SUPPORTED_SCOPES = [
   "workspace.read",
@@ -92,11 +92,55 @@ export class AuthStore {
   }
 
   private load(): void {
-    const data = readJsonIfExists<PersistedAuthState>(this.file);
-    if (!data) return;
+    if (!fs.existsSync(this.file)) return;
+    let data: unknown;
+    try {
+      data = readJsonStrict<unknown>(this.file);
+    } catch {
+      throw new Error("Canonical OAuth state is corrupt; refusing to start with a new token store.");
+    }
+    if (data === null) {
+      throw new Error("Canonical OAuth state is empty; refusing to start with a new token store.");
+    }
+    if (
+      !data ||
+      typeof data !== "object" ||
+      Array.isArray(data) ||
+      !Array.isArray((data as Partial<PersistedAuthState>).clients) ||
+      !Array.isArray((data as Partial<PersistedAuthState>).tokens)
+    ) {
+      throw new Error("Canonical OAuth state is invalid; refusing to start with a new token store.");
+    }
+    const state = data as PersistedAuthState;
     const now = Date.now();
-    for (const client of data.clients ?? []) this.clients.set(client.clientId, client);
-    for (const token of data.tokens ?? []) {
+    for (const client of state.clients) {
+      if (
+        !client ||
+        typeof client.clientId !== "string" ||
+        (client.clientName !== undefined && typeof client.clientName !== "string") ||
+        !Array.isArray(client.redirectUris) ||
+        client.redirectUris.some((uri) => typeof uri !== "string") ||
+        typeof client.createdAt !== "string"
+      ) {
+        throw new Error("Canonical OAuth client state is invalid; refusing to start.");
+      }
+      this.clients.set(client.clientId, client);
+    }
+    for (const token of state.tokens) {
+      if (
+        !token ||
+        typeof token.hash !== "string" ||
+        (token.kind !== "access" && token.kind !== "refresh") ||
+        typeof token.clientId !== "string" ||
+        typeof token.workspaceId !== "string" ||
+        !Array.isArray(token.scopes) ||
+        token.scopes.some((scope) => typeof scope !== "string") ||
+        typeof token.issuedAt !== "number" ||
+        typeof token.expiresAt !== "number" ||
+        typeof token.revoked !== "boolean"
+      ) {
+        throw new Error("Canonical OAuth token state is invalid; refusing to start.");
+      }
       if (!token.revoked && token.expiresAt > now) this.tokens.set(token.hash, token);
     }
   }
@@ -245,6 +289,19 @@ export class AuthStore {
     this.tokens.delete(record.hash);
     this.save();
     return true;
+  }
+
+  /** Revoke installation-internal tunnel credentials after daemon restart. */
+  revokeClientTokens(clientId: string): number {
+    let count = 0;
+    for (const [hash, token] of this.tokens) {
+      if (token.clientId !== clientId) continue;
+      token.revoked = true;
+      this.tokens.delete(hash);
+      count++;
+    }
+    if (count > 0) this.save();
+    return count;
   }
 
   /** Used by `c2c unpair`: revoke everything for this workspace. */

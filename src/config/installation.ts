@@ -1,3 +1,4 @@
+import fs from "node:fs";
 import path from "node:path";
 import { randomBytes } from "node:crypto";
 import { acquireStateLock } from "./lock.js";
@@ -36,13 +37,20 @@ function validIdentity(value: unknown): value is InstallationIdentity {
 }
 
 export function readInstallationIdentity(): InstallationIdentity | null {
+  const file = installationIdentityFile();
+  if (!fs.existsSync(file)) return null;
   let value: unknown;
   try {
-    value = readJsonStrict<unknown>(installationIdentityFile());
+    value = readJsonStrict<unknown>(file);
   } catch {
     throw new InstallationStateError("C2C installation identity is corrupt; refusing to create a new identity.");
   }
-  if (value === null) return null;
+  if (value === null) {
+    throw new InstallationStateError("C2C installation identity is empty; refusing to create a new identity.");
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value) || (value as { version?: unknown }).version !== 1) {
+    throw new InstallationStateError("C2C installation identity schema is unsupported; refusing to create a new identity.");
+  }
   if (!validIdentity(value)) {
     throw new InstallationStateError("C2C installation identity is invalid; refusing to create a new identity.");
   }

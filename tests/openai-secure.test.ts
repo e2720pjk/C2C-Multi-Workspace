@@ -98,6 +98,33 @@ describe("OpenAI Secure Tunnel integration", () => {
     await tunnel.stop();
   });
 
+  it("revokes the local bearer when an unexpected client exit invalidates the channel", async () => {
+    const stateDir = makeTmpDir("openai-tunnel-auth-revoke");
+    dirs.push(stateDir);
+    const child = fakeChild();
+    let invalidated = 0;
+    const tunnel = new OpenAiSecureTunnel({
+      stateDir,
+      tunnelId: "tunnel_0123456789abcdef0123456789abcdef",
+      apiKey: "runtime-secret",
+      recoveryLimit: 0,
+      binaryResolver: () => "/tmp/tunnel-client",
+      spawnProcess: (_binary, args) => {
+        const file = args[args.indexOf("--health.url-file") + 1];
+        fs.writeFileSync(file, "http://127.0.0.1:39999\\n", { mode: 0o600 });
+        return child as unknown as ChildProcess;
+      },
+      mcpAuthorization: () => ({ value: "Bearer local-token", expiresAt: Date.now() + 60_000 }),
+      onAuthorizationInvalidated: () => { invalidated++; },
+      readyProbe: async () => true,
+    });
+    await tunnel.start(48765);
+    child.kill("SIGKILL");
+    for (let i = 0; i < 20 && invalidated === 0; i++) await new Promise((resolve) => setTimeout(resolve, 25));
+    expect(invalidated).toBe(1);
+    await tunnel.stop();
+  });
+
   it("recovers one exited client and reads a replacement runtime key", async () => {
     const stateDir = makeTmpDir("openai-tunnel-recovery");
     dirs.push(stateDir);

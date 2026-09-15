@@ -1,15 +1,18 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { spawn } from "node:child_process";
 import path from "node:path";
 import { startBridge } from "../src/bridge/server.js";
 import {
   findBridgeObservation,
+  findInstallationObservation,
   findLiveBridge,
+  runtimeFile,
   writeRuntimeState,
   type RuntimeState,
 } from "../src/bridge/runtime.js";
 import { ensureBridge } from "../src/process/daemon.js";
-import { SERVICE_NAME, VERSION } from "../src/version.js";
+import { ensureInstallationIdentity, rememberInstallationPort } from "../src/config/installation.js";
+import { RUNTIME_BUILD_ID, RUNTIME_CONTRACT_ID, SERVICE_NAME, VERSION } from "../src/version.js";
 import { Workspace } from "../src/workspace/manager.js";
 import { cleanup, isolateStateDir, makeTmpDir, write } from "./helpers.js";
 
@@ -21,6 +24,12 @@ function stubRuntime(workspaceId: string, workspaceRoot: string, pid: number, po
     workspaceRoot,
     pid,
     port,
+    workspaceIds: [workspaceId],
+    defaultWorkspaceId: null,
+    installationId: "c2c_inst_test-runtime",
+    contractId: RUNTIME_CONTRACT_ID,
+    buildId: RUNTIME_BUILD_ID,
+    ownerToken: "test-owner",
     adminToken: "test-token",
     publicUrl: null,
     startedAt: new Date().toISOString(),
@@ -46,6 +55,54 @@ describe("findBridgeObservation", () => {
     expect(observation.state).toBe("stopped");
     if (observation.state === "stopped") expect(observation.reason).toBe("runtime_missing");
     expect(await findLiveBridge(workspace.id)).toBeNull();
+  });
+
+  it("fails closed when only an obsolete per-workspace runtime exists", async () => {
+    dirs.push(isolateStateDir());
+    const root = makeTmpDir("obs-obsolete-runtime");
+    dirs.push(root);
+    write(root, "a.txt", "a");
+    const workspace = new Workspace(root);
+    const obsolete = stubRuntime(workspace.id, workspace.root, 999_999_999, 1);
+    delete obsolete.workspaceIds;
+    writeRuntimeState(obsolete);
+    const observation = await findInstallationObservation();
+    expect(observation).toEqual({ state: "unknown", runtime: null, reason: "unsupported_state_schema" });
+    expect(runtimeFile(workspace.id)).toContain(`${workspace.id}.json`);
+  });
+
+  it("does not let an unrelated ambient response contaminate isolated state", async () => {
+    dirs.push(isolateStateDir());
+    const probe = vi.fn(async () => ({
+      service: SERVICE_NAME,
+      version: VERSION,
+      workspaceId: "ambient",
+      pid: 1234,
+      port: 48765,
+      status: "ok",
+    }));
+    const observation = await findInstallationObservation(undefined, { probe });
+    expect(observation.state).toBe("stopped");
+    expect(observation.reason).toBe("runtime_missing");
+    expect(probe).not.toHaveBeenCalled();
+  });
+
+  it("still protects a known installation port when runtime is missing", async () => {
+    dirs.push(isolateStateDir());
+    ensureInstallationIdentity();
+    rememberInstallationPort(48765);
+    const probe = vi.fn(async () => ({
+      service: SERVICE_NAME,
+      version: VERSION,
+      workspaceId: "ambient",
+      pid: 1234,
+      port: 48765,
+      status: "ok",
+    }));
+    const observation = await findInstallationObservation(undefined, { probe });
+    expect(observation.state).toBe("unknown");
+    expect(observation.reason).toBe("runtime_missing_but_bridge_alive");
+    expect(probe).toHaveBeenCalledWith(48765);
   });
 
   it("treats a dead pid plus a failed probe as stopped", async () => {
@@ -77,7 +134,7 @@ describe("findBridgeObservation", () => {
       writeRuntimeState(stubRuntime(workspace.id, workspace.root, child.pid, 1));
       const observation = await findBridgeObservation(workspace.id);
       expect(observation.state).toBe("unknown");
-      if (observation.state === "unknown") expect(observation.reason).toBe("probe_failed");
+      if (observation.state === "unknown") expect(observation.reason).toBe("process_identity_unverifiable");
       expect(await findLiveBridge(workspace.id)).toBeNull();
       await expect(ensureBridge(root)).rejects.toThrow(/uncertain/);
     } finally {

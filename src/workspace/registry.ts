@@ -72,11 +72,13 @@ function workspaceRegistryLockFile(file: string): string {
   return `${file}.lock`;
 }
 
+/** Comparison key only; the stored alias keeps its user-facing spelling. */
+export function canonicalAliasKey(value: string): string {
+  return value.normalize("NFKC").trim().toLowerCase();
+}
+
 function slugAlias(name: string, id: string): string {
-  const alias = name
-    .normalize("NFKC")
-    .trim()
-    .toLowerCase()
+  const alias = canonicalAliasKey(name)
     .replace(/[^\p{L}\p{N}]+/gu, "-")
     .replace(/^-+|-+$/g, "")
     .slice(0, 48);
@@ -87,7 +89,8 @@ function cleanAlias(value: string | undefined, fallback: string): string {
   const alias = value?.trim();
   if (!alias) return fallback;
   if (alias.length > 80) throw new WorkspaceRegistryError("INVALID_ALIAS", "Workspace alias is too long.");
-  if (alias.includes("\0") || alias.includes("/") || alias.includes("\\")) {
+  const key = canonicalAliasKey(alias);
+  if (alias.includes("\0") || alias.includes("/") || alias.includes("\\") || key.includes("\0") || key.includes("/") || key.includes("\\")) {
     throw new WorkspaceRegistryError("INVALID_ALIAS", "Workspace alias must not contain path separators.");
   }
   return alias;
@@ -101,10 +104,15 @@ function validRecord(value: unknown): value is RegisteredWorkspace {
     /^[a-f0-9]{12}$/.test(record.workspaceId) &&
     typeof record.alias === "string" &&
     record.alias.length > 0 &&
+    record.alias.length <= 80 &&
     record.alias === record.alias.trim() &&
+    canonicalAliasKey(record.alias).length > 0 &&
     !record.alias.includes("\0") &&
     !record.alias.includes("/") &&
     !record.alias.includes("\\") &&
+    !canonicalAliasKey(record.alias).includes("\0") &&
+    !canonicalAliasKey(record.alias).includes("/") &&
+    !canonicalAliasKey(record.alias).includes("\\") &&
     typeof record.displayName === "string" &&
     typeof record.root === "string" &&
     path.isAbsolute(record.root) &&
@@ -156,12 +164,15 @@ export class WorkspaceRegistry {
       return this.corrupt("Workspace registry has an invalid root");
     }
     const value = raw as Partial<PersistedWorkspaceRegistry>;
-    if (value.version !== 1 || !Array.isArray(value.workspaces)) {
-      return this.corrupt("Workspace registry version or workspace list is invalid");
+    if (value.version !== 1) {
+      return this.corrupt("Workspace registry schema version is unsupported");
+    }
+    if (!Array.isArray(value.workspaces)) {
+      return this.corrupt("Workspace registry workspace list is invalid");
     }
     const workspaces: RegisteredWorkspace[] = [];
     const ids = new Set<string>();
-    const aliases = new Set<string>();
+    const aliases = new Map<string, string>();
     for (const item of value.workspaces) {
       if (!validRecord(item)) return this.corrupt("Workspace registry contains an invalid record");
       if (ids.has(item.workspaceId)) {
@@ -170,18 +181,21 @@ export class WorkspaceRegistry {
           `Workspace identity collision in registry: ${item.workspaceId}`
         );
       }
-      if (aliases.has(item.alias)) {
+      const aliasKey = canonicalAliasKey(item.alias);
+      const previousAlias = aliases.get(aliasKey);
+      if (previousAlias !== undefined) {
         throw new WorkspaceRegistryError(
           "ALIAS_COLLISION",
-          `Workspace alias collision in registry: ${item.alias}`
+          `Workspace alias collision in registry: ${previousAlias} / ${item.alias}`
         );
       }
       ids.add(item.workspaceId);
-      aliases.add(item.alias);
+      aliases.set(aliasKey, item.alias);
       workspaces.push({ ...item });
     }
+    const identityKeys = new Set([...ids].map(canonicalAliasKey));
     for (const item of workspaces) {
-      if (workspaces.some((other) => other.workspaceId !== item.workspaceId && other.workspaceId === item.alias)) {
+      if (identityKeys.has(canonicalAliasKey(item.alias))) {
         throw new WorkspaceRegistryError(
           "ALIAS_COLLISION",
           `Workspace alias collides with an identity: ${item.alias}`
@@ -245,7 +259,10 @@ export class WorkspaceRegistry {
     if (idMatches.length > 1) {
       throw new WorkspaceRegistryError("WORKSPACE_ID_COLLISION", `Workspace identity collision: ${value}`);
     }
-    const matches = idMatches.length > 0 ? idMatches : state.workspaces.filter((workspace) => workspace.alias === value);
+    const aliasKey = canonicalAliasKey(value);
+    const matches = idMatches.length > 0
+      ? idMatches
+      : state.workspaces.filter((workspace) => canonicalAliasKey(workspace.alias) === aliasKey);
     if (matches.length === 0) {
       throw new WorkspaceRegistryError("UNKNOWN_WORKSPACE", `Unknown workspace: ${selector}`);
     }
@@ -295,19 +312,17 @@ export class WorkspaceRegistry {
         );
       }
       let alias = cleanAlias(opts.alias, existing?.alias ?? slugAlias(workspace.name, workspace.id));
+      const aliasKey = canonicalAliasKey(alias);
+      if (aliasKey === canonicalAliasKey(workspace.id)) {
+        throw new WorkspaceRegistryError("ALIAS_COLLISION", `Workspace alias collides with its identity: ${alias}`);
+      }
       const aliasOwner = state.workspaces.find(
         (item) =>
-          (item.alias === alias || item.workspaceId === alias) && item.workspaceId !== workspace.id
+          (canonicalAliasKey(item.alias) === aliasKey || canonicalAliasKey(item.workspaceId) === aliasKey) &&
+          item.workspaceId !== workspace.id
       );
       if (aliasOwner) {
-        if (!opts.alias) alias = `${alias}-${workspace.id.slice(0, 8)}`;
-        if (
-          state.workspaces.some(
-            (item) => (item.alias === alias || item.workspaceId === alias) && item.workspaceId !== workspace.id
-          )
-        ) {
-          throw new WorkspaceRegistryError("ALIAS_COLLISION", `Workspace alias is already registered: ${alias}`);
-        }
+        throw new WorkspaceRegistryError("ALIAS_COLLISION", `Workspace alias is already registered: ${alias}`);
       }
       const record: RegisteredWorkspace = {
         workspaceId: workspace.id,

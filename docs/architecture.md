@@ -46,7 +46,7 @@
 | `auth/` | OAuth 2.1 authorization server: discovery metadata (RFC 8414 + Protected Resource Metadata), dynamic client registration (RFC 7591), authorization-code + PKCE (S256 only), refresh rotation, revocation (RFC 7009). Opaque tokens stored as SHA-256 hashes |
 | `pairing/` | PairingCode lifecycle: CSPRNG generation, TTL, attempt limits, IP rate limit, one-time use |
 | `workspace/` | Canonical-path containment, sensitive-file policy, `.c2cignore`, paginated read/list, search/git, and the installation workspace registry |
-| `tunnel/` | Installation-owned `TunnelProvider` interface + Cloudflare Quick/Named and official OpenAI `tunnel-client` integration; legacy per-workspace configuration is only a migration fallback |
+| `tunnel/` | Installation-owned `TunnelProvider` interface + Cloudflare Quick/Named and official OpenAI `tunnel-client` integration; one canonical installation tunnel state |
 | `execution/` | JSONL execution records plus optional sanitized command output (`execution_output`) |
 | `process/` | Daemon spawn/reuse, health probing, graceful shutdown |
 | `cli/` | `c2c` commands; `--json` everywhere for the Skill |
@@ -68,21 +68,21 @@ authorization code → `/oauth/token` (PKCE S256) → access + refresh tokens.
 **Lifecycle/ports**: prefer 48765, bind 127.0.0.1 only. A state-directory
 startup lock serializes check-and-spawn, and the daemon holds an installation
 owner lock for its lifetime; a compatible `/health` + runtime/contract/build
-identity is reused, while an unknown/conflicting owner is never killed or
-silently reused.
+identity is reused. A build-mismatched daemon is replaced only after the same-
+installation owner lease, process identity, health, and authenticated admin
+endpoint all verify; unknown/conflicting owners are never killed or silently
+reused.
 A non-C2C occupant may still cause the single owner to fall back to an ephemeral
 port. Configuration follows via installation runtime state; users never manage
 ports. Registering another root updates the allowlist without starting a second
-daemon or tunnel.
+daemon or tunnel. Provider changes validate the candidate first, then serialize
+stop-and-state-update in this same installation startup critical section.
 
 **Tunnel**: default is a Cloudflare Quick Tunnel (`cloudflared tunnel --url …`); an installation may instead use the official OpenAI `tunnel-client` with an existing Tunnel ID and runtime `CONTROL_PLANE_API_KEY`. The child receives no `OPENAI_ADMIN_KEY`, and the tunnel-client owner lock plus daemon owner lock prevent two clients sharing one tunnel id/channel.
 The Quick Tunnel URL changes per start, so `c2c doctor` can restart it and tell the Skill to
 Delete + recreate the installation's ChatGPT connector; an OpenAI tunnel uses its
 stable tunnel-id URL. The workspace target never changes that connector. The Skill asks before the first public URL exists;
-`cloudflared tunnel login` is the only extra user step. Tunnel name, hostname
-and preference live under the OS state dir using the installation identity
-(old `tunnels/<workspaceId>.json` state is a migration fallback), never in the
-project. Named starts use `cloudflared tunnel --url … run <name>` so the public
+`cloudflared tunnel login` is the only extra user step. Tunnel name, hostname and preference live in one installation-owned record under the OS state dir, never in the project. Obsolete per-workspace tunnel records are not read. Named starts use `cloudflared tunnel --url … run <name>` so the public
 URL stays stable. If named provisioning fails, C2C falls back to Quick Tunnel.
 If a named tunnel later drops, doctor asks for a Cloudflare re-login
 (`namedRepair`) instead of rotating the one installation connector.

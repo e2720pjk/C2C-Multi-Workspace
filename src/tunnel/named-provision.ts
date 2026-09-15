@@ -190,7 +190,10 @@ export async function provisionNamedTunnel(opts: {
   zone: string;
   hostname?: string;
   account?: CloudflaredAccount;
+  /** Return a candidate without changing canonical state. */
+  persist?: boolean;
 }): Promise<ProvisionNamedResult> {
+  const persist = opts.persist ?? true;
   const account = opts.account ?? new ProcessCloudflaredAccount();
   let hostname: string;
   try {
@@ -198,7 +201,7 @@ export async function provisionNamedTunnel(opts: {
       ? normalizeNamedTunnelHostname(opts.hostname)
       : suggestedNamedHostname(opts.zone, opts.workspaceName, opts.workspaceId);
   } catch (error) {
-    return fallbackState(opts.workspaceId, "invalid_hostname", (error as Error).message);
+    return fallbackState(opts.workspaceId, "invalid_hostname", (error as Error).message, persist);
   }
 
   const tunnelName = `c2c-${opts.workspaceId}`;
@@ -206,38 +209,47 @@ export async function provisionNamedTunnel(opts: {
     if (!account.hasCert()) await account.login();
     const tunnel = await account.createTunnel(tunnelName);
     await account.routeDns(tunnel.name, hostname);
-    const state = writeTunnelState({
-      workspaceId: opts.workspaceId,
-      preference: "named",
-      askedAt: new Date().toISOString(),
-      provider: "cloudflare-named",
-      tunnelName: tunnel.name,
-      tunnelId: tunnel.id,
-      hostname,
-      zone: normalizeNamedTunnelHostname(opts.zone),
-      configuredAt: new Date().toISOString(),
-    });
-    return { ok: true, state, fallback: false };
+    const state = namedTunnelState(opts.workspaceId, tunnel.name, tunnel.id, hostname, opts.zone);
+    return { ok: true, state: persist ? writeTunnelState(state) : state, fallback: false };
   } catch (error) {
-    return fallbackState(opts.workspaceId, "provision_failed", (error as Error).message);
+    return fallbackState(opts.workspaceId, "provision_failed", (error as Error).message, persist);
   }
 }
 
-export function chooseQuickTunnel(workspaceId: string, fallbackReason?: string): TunnelState {
-  return writeTunnelState({
+function quickTunnelState(workspaceId: string, fallbackReason?: string): TunnelState {
+  return {
     workspaceId,
     preference: "quick",
     askedAt: new Date().toISOString(),
     provider: "cloudflare-quick",
     fallbackReason,
-  });
+  };
 }
 
-function fallbackState(workspaceId: string, reason: string, error: string): ProvisionNamedResult {
-  const state = chooseQuickTunnel(workspaceId, reason);
+export function chooseQuickTunnel(workspaceId: string, fallbackReason?: string, persist = true): TunnelState {
+  const state = quickTunnelState(workspaceId, fallbackReason);
+  return persist ? writeTunnelState(state) : state;
+}
+
+function namedTunnelState(workspaceId: string, tunnelName: string, tunnelId: string, hostname: string, zone: string): TunnelState {
+  return {
+    workspaceId,
+    preference: "named",
+    askedAt: new Date().toISOString(),
+    provider: "cloudflare-named",
+    tunnelName,
+    tunnelId,
+    hostname,
+    zone: normalizeNamedTunnelHostname(zone),
+    configuredAt: new Date().toISOString(),
+  };
+}
+
+function fallbackState(workspaceId: string, reason: string, error: string, persist: boolean): ProvisionNamedResult {
+  const state = quickTunnelState(workspaceId, reason);
   return {
     ok: true,
-    state,
+    state: persist ? writeTunnelState(state) : state,
     fallback: true,
     userMessage: NAMED_FALLBACK_MESSAGE,
     error,

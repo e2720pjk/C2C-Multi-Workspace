@@ -291,7 +291,7 @@ export class CloudflaredQuickTunnel implements TunnelProvider {
       running: this.child !== null && this.url !== null,
       url: this.url,
       provider: this.name,
-      detail: this.lastError ?? undefined,
+      detail: this.lastError ?? (this.child ? "tunnel running but not ready" : undefined),
     };
   }
 
