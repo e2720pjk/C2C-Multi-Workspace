@@ -86,10 +86,14 @@ whatever data it needs by itself and selects a workspace per request.
    - `report.bridge.ok` is not true
    - `report.mcp.ok` is not true (unauthenticated local `/mcp` must be 401)
    - sandbox / state-dir write failed (EPERM)
-   - this workspace used to have a public URL and the tunnel is down
+   - this installation used to have a public URL and the tunnel is down
    - `chatgptRepair.needed` is true (fix the connector first, then doctor again)
    - `namedRepair.needed` is true (user must log in to Cloudflare, then doctor again.
      Do not Delete the ChatGPT connector — the address did not change)
+   - the selected OpenAI Secure Tunnel is not ready or reports
+     `NEED_OPENAI_TUNNEL_CLIENT` / missing runtime credentials. Install the official
+     `tunnel-client` or provide `CONTROL_PLANE_TUNNEL_ID` and
+     `CONTROL_PLANE_API_KEY`; never ask for `OPENAI_ADMIN_KEY`.
    - `report.bridge` says 状态无法确认: the local bridge may still be running.
      Do not `c2c start`, do not Delete the connector, do not treat it as
      `chatgptRepair`. Wait and run doctor again.
@@ -238,7 +242,8 @@ that starts a tunnel). Do not mention tunnels, wrangler, DNS, or hostnames.
 Speak only of 临时地址 / 固定域名 / 登录 Cloudflare.
 
 1. `c2c tunnel status -w <workspace> --json` (the choice is stored for the installation)
-2. If `needsChoice` is false: do not ask again.
+2. If `needsChoice` is false: do not ask again. If `provider` is `openai-secure`,
+   use the already configured OpenAI connection and do not ask the Cloudflare question.
 3. If `needsChoice` is true: tell the user exactly `userPrompt` and wait.
    - 没有账号 / 没有域名 / 临时 / 不用 →
      `c2c tunnel choose -w <ws> --mode quick --json`
@@ -255,7 +260,9 @@ Speak only of 临时地址 / 固定域名 / 登录 Cloudflare.
 
 ## Workflow: first-time setup（"使用 Codex with ChatGPT 完成首次配置"）
 
-1. Detect prerequisites yourself: `node --version` (>= 20), and check `cloudflared`.
+1. Detect prerequisites yourself: `node --version` (>= 20), and check the selected
+   tunnel binary (`cloudflared`, or official `tunnel-client` when OpenAI runtime
+   credentials are configured).
    - If cloudflared is missing on macOS run `brew install cloudflared`; on Windows use
      `winget install Cloudflare.cloudflared`. Do this yourself; don't ask.
 2. If the c2c repo has no `node_modules`, run `pnpm install && pnpm build` in it.
@@ -713,13 +720,17 @@ the previous public address is gone. Doctor already started a new one.
 
 ## Workflow: repair（anything looks broken）
 
-1. `c2c doctor -w <workspace> --json`. Doctor gate: do not open ChatGPT / send
+1. `c2c doctor -w <workspace> --json`. Doctor covers the installation daemon and
+   its single tunnel owner. Do not open ChatGPT / send
    `[C2C]` until local is green, except reconnect settings pages.
-2. If `namedRepair.needed`, tell the user `namedRepair.userMessage`, run
+2. If the selected OpenAI Secure Tunnel is not ready, install/configure the
+   official `tunnel-client` using the existing tunnel id and runtime key, then
+   doctor again. Never use `OPENAI_ADMIN_KEY` or start a second client.
+3. If `namedRepair.needed`, tell the user `namedRepair.userMessage`, run
    `c2c tunnel login --json`, then doctor again. Do not Delete the connector.
-3. If `chatgptRepair.needed`, follow **reconnect after address reclaim**, then
+4. If `chatgptRepair.needed`, follow **reconnect after address reclaim**, then
    doctor again.
-4. Otherwise apply the recovery map. Only involve the user for login / 2FA /
+5. Otherwise apply the recovery map. Only involve the user for login / 2FA /
    CAPTCHA — one action.
 
 ## Recovery map
@@ -727,7 +738,7 @@ the previous public address is gone. Doctor already started a new one.
 | Symptom | Action |
 | --- | --- |
 | Bridge not running | `c2c start` (doctor does this automatically) |
-| Tunnel dead / URL unreachable / 全关掉后连接失效 | `c2c doctor` → if `namedRepair.needed`, login to Cloudflare and doctor again (do not Delete). If `chatgptRepair.needed`, tell the user the message, then **Delete** the installation connector only (`connectorName`) and create it again. Never Reconnect. After recreate, re-check `workspace_info` in the saved chat; if it still fails, new chat in the same Project (or long-chat switch) + HANDOFF. |
+| Tunnel dead / URL unreachable / 全关掉后连接失效 | `c2c doctor` → if OpenAI is selected, repair the official `tunnel-client` prerequisite/credentials; if `namedRepair.needed`, login to Cloudflare and doctor again (do not Delete). If `chatgptRepair.needed`, tell the user the message, then **Delete** the installation connector only (`connectorName`) and create it again. Never Reconnect. After recreate, re-check `workspace_info` in the saved chat; if it still fails, new chat in the same Project (or long-chat switch) + HANDOFF. |
 | Collection page shows only Retry | Same iab tab: Retry once, then open the last working chat and click its Project link. Do not write INIT/EXECUTED waiting checkpoints until the message is visible. |
 | ChatGPT says tool call failed / 401 | token expired or revoked → re-pair (new pairing code + authorize) |
 | Pairing code rejected/expired | `c2c pair --json` for a fresh code |

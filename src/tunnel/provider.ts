@@ -1,8 +1,7 @@
 /**
  * Tunnel abstraction. Business logic never talks to a specific vendor;
- * it only sees this interface. V1 ships a Cloudflare Quick Tunnel provider,
- * but ngrok / Tailscale / custom providers can be added without touching
- * the bridge.
+ * it only sees this interface. Providers may expose a public URL (Cloudflare)
+ * or use an existing control-plane identity without one (OpenAI Secure Tunnel).
  */
 export interface TunnelStatus {
   running: boolean;
@@ -22,10 +21,10 @@ export interface TunnelDoctorReport {
 
 export interface TunnelProvider {
   readonly name: string;
-  /** Start the tunnel for a local port; resolves with the public URL. */
-  start(localPort: number): Promise<string>;
+  /** Start the tunnel for a local port; null means the provider has no public URL. */
+  start(localPort: number): Promise<string | null>;
   stop(): Promise<void>;
-  restart(localPort: number): Promise<string>;
+  restart(localPort: number): Promise<string | null>;
   status(): TunnelStatus;
   getPublicUrl(): string | null;
   doctor(): Promise<TunnelDoctorReport>;

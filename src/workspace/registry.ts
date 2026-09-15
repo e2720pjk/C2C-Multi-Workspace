@@ -1,7 +1,9 @@
+import fs from "node:fs";
 import path from "node:path";
+import { acquireStateLock } from "../config/lock.js";
+import { getStateDir, readJsonStrict, writeSecureJson } from "../config/paths.js";
 import { Workspace } from "./manager.js";
 import { gitInfo } from "./git.js";
-import { getStateDir, readJsonIfExists, writeSecureJson } from "../config/paths.js";
 
 export type WorkspaceRegistryErrorCode =
   | "UNKNOWN_WORKSPACE"
@@ -9,7 +11,10 @@ export type WorkspaceRegistryErrorCode =
   | "UNAVAILABLE_WORKSPACE"
   | "AMBIGUOUS_WORKSPACE"
   | "INVALID_WORKSPACE_ID"
+  | "INVALID_ALIAS"
+  | "ALIAS_COLLISION"
   | "WORKSPACE_ID_COLLISION"
+  | "REGISTRY_CORRUPT"
   | "NO_DEFAULT_WORKSPACE";
 
 export class WorkspaceRegistryError extends Error {
@@ -63,6 +68,10 @@ export function workspaceRegistryFile(): string {
   return path.join(getStateDir(), "workspaces.json");
 }
 
+function workspaceRegistryLockFile(file: string): string {
+  return `${file}.lock`;
+}
+
 function slugAlias(name: string, id: string): string {
   const alias = name
     .normalize("NFKC")
@@ -77,9 +86,9 @@ function slugAlias(name: string, id: string): string {
 function cleanAlias(value: string | undefined, fallback: string): string {
   const alias = value?.trim();
   if (!alias) return fallback;
-  if (alias.length > 80) throw new WorkspaceRegistryError("UNKNOWN_WORKSPACE", "Workspace alias is too long.");
+  if (alias.length > 80) throw new WorkspaceRegistryError("INVALID_ALIAS", "Workspace alias is too long.");
   if (alias.includes("\0") || alias.includes("/") || alias.includes("\\")) {
-    throw new WorkspaceRegistryError("UNKNOWN_WORKSPACE", "Workspace alias must not contain path separators.");
+    throw new WorkspaceRegistryError("INVALID_ALIAS", "Workspace alias must not contain path separators.");
   }
   return alias;
 }
@@ -91,8 +100,14 @@ function validRecord(value: unknown): value is RegisteredWorkspace {
     typeof record.workspaceId === "string" &&
     /^[a-f0-9]{12}$/.test(record.workspaceId) &&
     typeof record.alias === "string" &&
+    record.alias.length > 0 &&
+    record.alias === record.alias.trim() &&
+    !record.alias.includes("\0") &&
+    !record.alias.includes("/") &&
+    !record.alias.includes("\\") &&
     typeof record.displayName === "string" &&
     typeof record.root === "string" &&
+    path.isAbsolute(record.root) &&
     typeof record.enabled === "boolean" &&
     typeof record.registeredAt === "string" &&
     typeof record.updatedAt === "string"
@@ -106,9 +121,9 @@ function emptyState(): PersistedWorkspaceRegistry {
 /**
  * Installation-wide registered workspace allowlist.
  *
- * Resolution reloads the file before every operation. That keeps a running
- * bridge in sync with `c2c workspace add/disable/remove` without a mutable
- * process-global current workspace and without a second admin protocol.
+ * Resolution reloads the file before every operation. Mutations take an
+ * installation state lock and replace the JSON atomically, so two CLI
+ * processes cannot lose each other's registrations or leave a partial file.
  */
 export class WorkspaceRegistry {
   private readonly file: string;
@@ -121,32 +136,90 @@ export class WorkspaceRegistry {
     this.reload();
   }
 
+  private corrupt(message: string): never {
+    throw new WorkspaceRegistryError("REGISTRY_CORRUPT", `${message} (${this.file})`);
+  }
+
   private read(): PersistedWorkspaceRegistry {
     if (!this.persist) return this.memory;
-    const raw = readJsonIfExists<unknown>(this.file);
-    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return emptyState();
+    let raw: unknown;
+    try {
+      raw = readJsonStrict<unknown>(this.file);
+    } catch {
+      return this.corrupt("Workspace registry is not valid JSON");
+    }
+    if (raw === null) {
+      if (!fs.existsSync(this.file)) return emptyState();
+      return this.corrupt("Workspace registry is empty or null");
+    }
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+      return this.corrupt("Workspace registry has an invalid root");
+    }
     const value = raw as Partial<PersistedWorkspaceRegistry>;
-    const workspaces = Array.isArray(value.workspaces) ? value.workspaces.filter(validRecord) : [];
+    if (value.version !== 1 || !Array.isArray(value.workspaces)) {
+      return this.corrupt("Workspace registry version or workspace list is invalid");
+    }
+    const workspaces: RegisteredWorkspace[] = [];
     const ids = new Set<string>();
-    for (const workspace of workspaces) {
-      if (ids.has(workspace.workspaceId)) {
+    const aliases = new Set<string>();
+    for (const item of value.workspaces) {
+      if (!validRecord(item)) return this.corrupt("Workspace registry contains an invalid record");
+      if (ids.has(item.workspaceId)) {
         throw new WorkspaceRegistryError(
           "WORKSPACE_ID_COLLISION",
-          `Workspace identity collision in registry: ${workspace.workspaceId}`
+          `Workspace identity collision in registry: ${item.workspaceId}`
         );
       }
-      ids.add(workspace.workspaceId);
+      if (aliases.has(item.alias)) {
+        throw new WorkspaceRegistryError(
+          "ALIAS_COLLISION",
+          `Workspace alias collision in registry: ${item.alias}`
+        );
+      }
+      ids.add(item.workspaceId);
+      aliases.add(item.alias);
+      workspaces.push({ ...item });
     }
-    const defaultWorkspaceId =
-      typeof value.defaultWorkspaceId === "string" && ids.has(value.defaultWorkspaceId)
-        ? value.defaultWorkspaceId
-        : null;
-    return { version: 1, defaultWorkspaceId, workspaces };
+    for (const item of workspaces) {
+      if (workspaces.some((other) => other.workspaceId !== item.workspaceId && other.workspaceId === item.alias)) {
+        throw new WorkspaceRegistryError(
+          "ALIAS_COLLISION",
+          `Workspace alias collides with an identity: ${item.alias}`
+        );
+      }
+    }
+    if (value.defaultWorkspaceId !== null && typeof value.defaultWorkspaceId !== "string") {
+      return this.corrupt("Workspace registry default is invalid");
+    }
+    if (typeof value.defaultWorkspaceId === "string" && !ids.has(value.defaultWorkspaceId)) {
+      return this.corrupt("Workspace registry default does not name a registered workspace");
+    }
+    return {
+      version: 1,
+      defaultWorkspaceId: value.defaultWorkspaceId ?? null,
+      workspaces,
+    };
   }
 
   private write(state: PersistedWorkspaceRegistry): void {
     this.memory = state;
     if (this.persist) writeSecureJson(this.file, state);
+  }
+
+  private mutate<T>(fn: (state: PersistedWorkspaceRegistry) => T): T {
+    if (!this.persist) {
+      const result = fn(this.memory);
+      return result;
+    }
+    const lock = acquireStateLock(workspaceRegistryLockFile(this.file));
+    try {
+      const state = this.read();
+      const result = fn(state);
+      this.write(state);
+      return result;
+    } finally {
+      lock.release();
+    }
   }
 
   reload(): void {
@@ -186,12 +259,13 @@ export class WorkspaceRegistry {
     return workspace;
   }
 
-  private workspaceFor(record: RegisteredWorkspace): Workspace {
-    if (!record.enabled) {
-      throw new WorkspaceRegistryError("DISABLED_WORKSPACE", `Workspace is disabled: ${record.alias}`);
-    }
+  private canonicalWorkspaceFor(record: RegisteredWorkspace): Workspace {
     try {
-      return new Workspace(record.root);
+      const workspace = new Workspace(record.root);
+      if (workspace.id !== record.workspaceId || workspace.root !== record.root) {
+        throw new Error("canonical root or workspace identity changed since registration");
+      }
+      return workspace;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       throw new WorkspaceRegistryError(
@@ -201,37 +275,57 @@ export class WorkspaceRegistry {
     }
   }
 
+  private workspaceFor(record: RegisteredWorkspace): Workspace {
+    if (!record.enabled) {
+      throw new WorkspaceRegistryError("DISABLED_WORKSPACE", `Workspace is disabled: ${record.alias}`);
+    }
+    return this.canonicalWorkspaceFor(record);
+  }
+
   /** Register a canonical root, or re-enable/update an existing registration. */
   register(rootInput: string, opts: { alias?: string; enabled?: boolean } = {}): RegisteredWorkspace {
     const workspace = new Workspace(rootInput);
-    const state = this.state();
-    const now = new Date().toISOString();
-    const existing = state.workspaces.find((item) => item.workspaceId === workspace.id);
-    if (existing && existing.root !== workspace.root) {
-      throw new WorkspaceRegistryError(
-        "WORKSPACE_ID_COLLISION",
-        `Workspace id ${workspace.id} maps to more than one canonical root.`
+    return this.mutate((state) => {
+      const now = new Date().toISOString();
+      const existing = state.workspaces.find((item) => item.workspaceId === workspace.id);
+      if (existing && existing.root !== workspace.root) {
+        throw new WorkspaceRegistryError(
+          "WORKSPACE_ID_COLLISION",
+          `Workspace id ${workspace.id} maps to more than one canonical root.`
+        );
+      }
+      let alias = cleanAlias(opts.alias, existing?.alias ?? slugAlias(workspace.name, workspace.id));
+      const aliasOwner = state.workspaces.find(
+        (item) =>
+          (item.alias === alias || item.workspaceId === alias) && item.workspaceId !== workspace.id
       );
-    }
-    const alias = cleanAlias(opts.alias, existing?.alias ?? slugAlias(workspace.name, workspace.id));
-    const record: RegisteredWorkspace = {
-      workspaceId: workspace.id,
-      alias,
-      displayName: workspace.name,
-      root: workspace.root,
-      enabled: opts.enabled ?? true,
-      registeredAt: existing?.registeredAt ?? now,
-      updatedAt: now,
-    };
-    if (existing) {
-      const index = state.workspaces.indexOf(existing);
-      state.workspaces[index] = record;
-    } else {
-      state.workspaces.push(record);
-    }
-    if (!state.defaultWorkspaceId) state.defaultWorkspaceId = record.workspaceId;
-    this.write(state);
-    return { ...record };
+      if (aliasOwner) {
+        if (!opts.alias) alias = `${alias}-${workspace.id.slice(0, 8)}`;
+        if (
+          state.workspaces.some(
+            (item) => (item.alias === alias || item.workspaceId === alias) && item.workspaceId !== workspace.id
+          )
+        ) {
+          throw new WorkspaceRegistryError("ALIAS_COLLISION", `Workspace alias is already registered: ${alias}`);
+        }
+      }
+      const record: RegisteredWorkspace = {
+        workspaceId: workspace.id,
+        alias,
+        displayName: workspace.name,
+        root: workspace.root,
+        enabled: opts.enabled ?? true,
+        registeredAt: existing?.registeredAt ?? now,
+        updatedAt: now,
+      };
+      if (existing) {
+        const index = state.workspaces.indexOf(existing);
+        state.workspaces[index] = record;
+      } else {
+        state.workspaces.push(record);
+      }
+      return { ...record };
+    });
   }
 
   list(): RegisteredWorkspace[] {
@@ -241,6 +335,32 @@ export class WorkspaceRegistry {
 
   defaultWorkspaceId(): string | null {
     return this.state().defaultWorkspaceId;
+  }
+
+  /** Select bridge metadata without changing request default semantics. */
+  primary(): Workspace {
+    const state = this.state();
+    const configured = state.defaultWorkspaceId
+      ? this.findBySelector(state, state.defaultWorkspaceId, { allowDisabled: true })
+      : undefined;
+    const candidates = [
+      ...(configured?.enabled ? [configured] : []),
+      ...state.workspaces.filter((workspace) => workspace.enabled && workspace !== configured),
+    ];
+    let unavailable: WorkspaceRegistryError | null = null;
+    for (const record of candidates) {
+      try {
+        return this.workspaceFor(record);
+      } catch (error) {
+        if (error instanceof WorkspaceRegistryError && error.code === "UNAVAILABLE_WORKSPACE") {
+          unavailable = error;
+          continue;
+        }
+        throw error;
+      }
+    }
+    if (unavailable) throw unavailable;
+    throw new WorkspaceRegistryError("NO_DEFAULT_WORKSPACE", "No enabled workspace is registered.");
   }
 
   resolve(selector?: string): Workspace {
@@ -277,35 +397,30 @@ export class WorkspaceRegistry {
   }
 
   setDefault(selector: string): RegisteredWorkspace {
-    const state = this.state();
-    const record = this.findBySelector(state, selector);
-    this.workspaceFor(record);
-    state.defaultWorkspaceId = record.workspaceId;
-    this.write(state);
-    return { ...record };
+    return this.mutate((state) => {
+      const record = this.findBySelector(state, selector);
+      this.workspaceFor(record);
+      state.defaultWorkspaceId = record.workspaceId;
+      return { ...record };
+    });
   }
 
   setEnabled(selector: string, enabled: boolean): RegisteredWorkspace {
-    const state = this.state();
-    const record = this.findBySelector(state, selector, { allowDisabled: true });
-    record.enabled = enabled;
-    record.updatedAt = new Date().toISOString();
-    this.write(state);
-    return { ...record };
+    return this.mutate((state) => {
+      const record = this.findBySelector(state, selector, { allowDisabled: true });
+      record.enabled = enabled;
+      record.updatedAt = new Date().toISOString();
+      return { ...record };
+    });
   }
 
   remove(selector: string): RegisteredWorkspace {
-    const state = this.state();
-    const record = this.findBySelector(state, selector, { allowDisabled: true });
-    state.workspaces = state.workspaces.filter((workspace) => workspace.workspaceId !== record.workspaceId);
-    if (state.defaultWorkspaceId === record.workspaceId) {
-      const next = state.workspaces
-        .filter((workspace) => workspace.enabled)
-        .sort((a, b) => a.registeredAt.localeCompare(b.registeredAt) || a.workspaceId.localeCompare(b.workspaceId))[0];
-      state.defaultWorkspaceId = next?.workspaceId ?? null;
-    }
-    this.write(state);
-    return { ...record };
+    return this.mutate((state) => {
+      const record = this.findBySelector(state, selector, { allowDisabled: true });
+      state.workspaces = state.workspaces.filter((workspace) => workspace.workspaceId !== record.workspaceId);
+      if (state.defaultWorkspaceId === record.workspaceId) state.defaultWorkspaceId = null;
+      return { ...record };
+    });
   }
 
   summaries(): WorkspaceSummary[] {
@@ -316,7 +431,7 @@ export class WorkspaceRegistry {
       let languages: string[] = [];
       let branch: string | null = null;
       try {
-        const workspace = new Workspace(record.root);
+        const workspace = this.canonicalWorkspaceFor(record);
         available = true;
         const project = workspace.detectProject();
         projectType = project.projectType;

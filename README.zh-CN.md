@@ -70,11 +70,26 @@ Ready.
 
 ### 可选的固定域名
 
-默认公网地址是临时的，桥重启后会变。Codex 会删掉这个项目的 ChatGPT 插件再按新地址加回去。
+默认公网地址是临时的，桥重启后会变。Codex 会删掉这个安装的 ChatGPT 连接器再按新地址加回去。
 
 如果你有 Cloudflare 账号，并且域名已经加在 Cloudflare 上，首次配置时（老用户则在下一次编码时问一次）会问你要不要用固定域名，例如 `c2c-<项目>.你的域名`。选是的话，浏览器里授权一次 Cloudflare 即可。之后重启一般不用再改插件。没有账号、不想用、登录失败：继续用临时地址，功能一样，只是修复更慢。
 
 凭证放在系统目录，不进项目。
+
+### 可选的 OpenAI Secure Tunnel
+
+如果已经在 OpenAI 配置好 Tunnel，可使用官方 `tunnel-client`（正常运行不需要
+`OPENAI_ADMIN_KEY`）：
+
+```bash
+export CONTROL_PLANE_TUNNEL_ID=tunnel_...
+export CONTROL_PLANE_API_KEY=...
+c2c tunnel choose --mode openai
+c2c start --tunnel
+```
+
+C2C 从 PATH 或 `C2C_TUNNEL_CLIENT_PATH` 查找官方客户端，并且每个安装只运行一个
+client。Tunnel 的创建和删除仍由外部配置负责。
 
 ### 多 workspace
 
@@ -89,8 +104,9 @@ c2c workspace set-default main
 ```
 
 ChatGPT 先调用 `list_workspaces`，再给 `read_file`、`git_status` 等工具传入
-`workspace: "main"` 或返回的 `workspaceId`。不填写时使用持久化的默认值；未知、
-停用、移除或别名歧义会直接失败，不会悄悄回退到默认值。详见
+`workspace: "main"` 或返回的 `workspaceId`。只有一个启用 workspace 时可省略；多个时
+请先设置明确默认值，或每次传入 `workspace`。未知、停用、移除或别名冲突会直接失败，
+不会悄悄回退到默认值。详见
 [多 workspace 文档](docs/multi-workspace.md)。
 
 ## 工作原理
@@ -107,7 +123,7 @@ ChatGPT 先调用 `list_workspaces`，再给 `read_file`、`git_status` 等工�
              ┌─────────────────────┐
              │      C2C Bridge     │   仅监听本机回环地址
              │  只读 MCP           │   OAuth 2.1 + 一次性配对码
-             │  OAuth + 配对       │   Cloudflare Quick Tunnel
+             │  OAuth + 配对       │   Cloudflare / OpenAI Tunnel
              │  Tunnel 管理        │
              └──────────┬──────────┘
                         │  按请求路由，只读
@@ -122,8 +138,8 @@ ChatGPT 先调用 `list_workspaces`，再给 `read_file`、`git_status` 等工�
   状态消息——`INIT → PLAN → EXECUTED → REVIEW → DONE`。绝不粘贴 diff、日志
   或文件内容。
 - **数据面（MCP）**：ChatGPT 缺什么自己拉什么。`list_workspaces` 用来发现已注册
-  workspace；所有依赖 workspace 的工具都接受 workspace ID/别名，不填时使用
-  稳定的默认 workspace。
+  workspace；所有依赖 workspace 的工具都接受 workspace ID/别名；配置了默认值时不填
+  就使用它，只有一个启用 workspace 时也可省略。
 - **独立审查**：Codex 执行完毕后，ChatGPT 通过 MCP 亲自检查真实的 git diff
   和测试记录——绝不因为 Codex 说"测试全过"就直接相信。
 
@@ -149,7 +165,7 @@ ChatGPT 先调用 `list_workspaces`，再给 `read_file`、`git_status` 等工�
 ```bash
 pnpm install
 pnpm build          # 产出 dist/，暴露 c2c 命令
-pnpm test           # vitest：150 个测试（路径安全、OAuth、配对、MCP 端到端）
+pnpm test           # vitest：路径安全、OAuth、生命周期、Tunnel、配对、MCP 端到端
 
 c2c setup           # 一条命令：Bridge + 隧道 + 配对码
 c2c sandbox-allow   # 把本地设置目录加入 Codex 沙箱白名单（macOS / Windows）
@@ -157,8 +173,9 @@ c2c status / doctor / pair / unpair / logs / stop
 c2c workspace add/list/set-default/enable/disable/remove
 ```
 
-环境要求：Node.js >= 20、git；公网连接需要 `cloudflared`
-（自动检测，Skill 会替你安装）。如果 QUIC 被拦截，设置
+环境要求：Node.js >= 20、git；Cloudflare 公网连接需要 `cloudflared`
+（自动检测，Skill 会替你安装）。OpenAI 方式使用官方已安装的 `tunnel-client`，
+不在 PATH 时可设置 `C2C_TUNNEL_CLIENT_PATH`。如果 QUIC 被拦截，设置
 `C2C_TUNNEL_PROTOCOL=http2` 后重启 Bridge。
 
 文档：[多 workspace](docs/multi-workspace.md) · [架构](docs/architecture.md) ·
@@ -173,7 +190,7 @@ src/
   auth/       OAuth 2.1（PKCE、动态注册、refresh 轮换、吊销）
   pairing/    一次性配对码（CSPRNG、TTL、限速）
   workspace/  workspace 注册表、路径收敛、敏感文件策略、搜索、git
-  tunnel/     安装级 TunnelProvider 抽象 + Cloudflare Quick/Named Tunnel
+  tunnel/     安装级 TunnelProvider + Cloudflare Quick/Named + OpenAI tunnel-client
   execution/  审查闭环所需的执行记录
   process/    守护进程生命周期
   cli/        c2c 命令行

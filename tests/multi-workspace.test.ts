@@ -122,7 +122,30 @@ describe("installation multi-workspace routing", () => {
     expect(body(ref).content).toContain("gemini-refactor");
   });
 
-  it("fails closed for unknown, disabled, and ambiguous selectors", async () => {
+  it("keeps list_workspaces in the tool surface as registration grows", async () => {
+    const registry = new WorkspaceRegistry({ persist: false });
+    registry.register(a, { alias: "main" });
+    const routed = await startBridge({ registry, workspaceRoot: a, port: 0, persistRuntime: false });
+    const token = routed.authStore.issueTokens({ clientId: "stable-tools", scopes: ["workspace.read"] }).accessToken;
+    const stableClient = new Client({ name: "stable-tools", version: "1" });
+    await stableClient.connect(new StreamableHTTPClientTransport(new URL(`${routed.localBaseUrl()}/mcp`), {
+      requestInit: { headers: { authorization: `Bearer ${token}` } },
+    }));
+    try {
+      const before = await stableClient.listTools();
+      expect(before.tools.map((tool) => tool.name)).toContain("list_workspaces");
+      registry.register(b, { alias: "gemini-refactor" });
+      const after = await stableClient.listTools();
+      expect(after.tools.map((tool) => tool.name)).toEqual(before.tools.map((tool) => tool.name));
+      const listed = await stableClient.callTool({ name: "list_workspaces", arguments: {} });
+      expect(body(listed).workspaces).toHaveLength(2);
+    } finally {
+      await stableClient.close();
+      await routed.close();
+    }
+  });
+
+  it("fails closed for unknown, disabled, removed, and alias-collision selectors", async () => {
     const unknown = await client.callTool({ name: "workspace_info", arguments: { workspace: "does-not-exist" } });
     expect(body(unknown).error).toBe("UNKNOWN_WORKSPACE");
 
@@ -139,16 +162,13 @@ describe("installation multi-workspace routing", () => {
     expect(body(removedResult).error).toBe("UNKNOWN_WORKSPACE");
     cleanup(removed);
 
-    const c = makeTmpDir("ambiguous-c");
-    const d = makeTmpDir("ambiguous-d");
+    const c = makeTmpDir("collision-c");
+    const d = makeTmpDir("collision-d");
     write(c, "x.txt", "c");
     write(d, "x.txt", "d");
     bridge.registry.register(c, { alias: "same" });
-    bridge.registry.register(d, { alias: "same" });
-    const ambiguous = await client.callTool({ name: "workspace_info", arguments: { workspace: "same" } });
-    expect(body(ambiguous).error).toBe("AMBIGUOUS_WORKSPACE");
+    expect(() => bridge.registry.register(d, { alias: "same" })).toThrow(/already registered/);
     bridge.registry.remove(new Workspace(c).id);
-    bridge.registry.remove(new Workspace(d).id);
     cleanup(c);
     cleanup(d);
   });
@@ -194,7 +214,15 @@ describe("installation multi-workspace routing", () => {
         requestInit: { headers: { authorization: `Bearer ${token}` } },
       })
     );
-    await tunnel.start(routedBridge.port);
+    const admin = {
+      "content-type": "application/json",
+      authorization: `Bearer ${routedBridge.adminToken}`,
+    };
+    const tunnelStarts = await Promise.all([
+      fetch(`${routedBridge.localBaseUrl()}/admin/tunnel/start`, { method: "POST", headers: admin }),
+      fetch(`${routedBridge.localBaseUrl()}/admin/tunnel/start`, { method: "POST", headers: admin }),
+    ]);
+    expect(tunnelStarts.every((response) => response.status === 200)).toBe(true);
     await Promise.all([
       routedClient.callTool({ name: "read_file", arguments: { workspace: "main", path: "same.ts" } }),
       routedClient.callTool({ name: "read_file", arguments: { workspace: "gemini-refactor", path: "same.ts" } }),
@@ -205,10 +233,18 @@ describe("installation multi-workspace routing", () => {
     await routedBridge.close();
   });
 
-  it("uses a stable default without changing it during concurrent calls", async () => {
-    const defaultResult = await client.callTool({ name: "workspace_info", arguments: {} });
-    expect(body(defaultResult).workspaceId).toBe(new Workspace(a).id);
+  it("requires an explicit default when multiple workspaces exist", async () => {
+    const omitted = await client.callTool({ name: "workspace_info", arguments: {} });
+    expect(body(omitted).error).toBe("NO_DEFAULT_WORKSPACE");
+
     const registry = bridge.registry as WorkspaceRegistry;
+    registry.setDefault("main");
+    const [first, second] = await Promise.all([
+      client.callTool({ name: "workspace_info", arguments: {} }),
+      client.callTool({ name: "workspace_info", arguments: {} }),
+    ]);
+    expect(body(first).workspaceId).toBe(new Workspace(a).id);
+    expect(body(second).workspaceId).toBe(new Workspace(a).id);
     expect(registry.defaultWorkspaceId()).toBe(new Workspace(a).id);
   });
 });

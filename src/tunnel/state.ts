@@ -1,13 +1,14 @@
 import path from "node:path";
-import { getStateDir, readJsonIfExists, writeSecureJson } from "../config/paths.js";
+import { acquireStateLock } from "../config/lock.js";
+import { getStateDir, readJsonStrict, writeSecureJson } from "../config/paths.js";
 
-export type TunnelPreference = "unset" | "quick" | "named";
+export type TunnelPreference = "unset" | "quick" | "named" | "openai";
 
 export interface TunnelState {
   workspaceId: string;
   preference: TunnelPreference;
   askedAt?: string;
-  provider?: "cloudflare-quick" | "cloudflare-named";
+  provider?: "cloudflare-quick" | "cloudflare-named" | "openai-secure";
   tunnelName?: string;
   tunnelId?: string;
   hostname?: string;
@@ -21,12 +22,27 @@ export function tunnelStateFile(workspaceId: string): string {
 }
 
 export function readTunnelState(workspaceId: string): TunnelState {
-  return (
-    readJsonIfExists<TunnelState>(tunnelStateFile(workspaceId)) ?? {
-      workspaceId,
-      preference: "unset",
-    }
-  );
+  let value: unknown;
+  try {
+    value = readJsonStrict<unknown>(tunnelStateFile(workspaceId));
+  } catch {
+    throw new Error(`Tunnel state is corrupt for ${workspaceId}; refusing to start or replace a tunnel.`);
+  }
+  if (value === null) return { workspaceId, preference: "unset" };
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`Tunnel state is invalid for ${workspaceId}; refusing to start or replace a tunnel.`);
+  }
+  const state = value as Partial<TunnelState>;
+  const stringFields = ["workspaceId", "preference", "askedAt", "provider", "tunnelName", "tunnelId", "hostname", "zone", "configuredAt", "fallbackReason"] as const;
+  if (
+    state.workspaceId !== workspaceId ||
+    !["unset", "quick", "named", "openai"].includes(state.preference ?? "") ||
+    stringFields.some((field) => state[field] !== undefined && typeof state[field] !== "string") ||
+    (state.provider !== undefined && !["cloudflare-quick", "cloudflare-named", "openai-secure"].includes(state.provider))
+  ) {
+    throw new Error(`Tunnel state is invalid for ${workspaceId}; refusing to start or replace a tunnel.`);
+  }
+  return state as TunnelState;
 }
 
 /** Installation tunnel state wins; old per-workspace state is a migration fallback. */
@@ -37,8 +53,15 @@ export function readInstallationTunnelState(defaultWorkspaceId?: string): Tunnel
 }
 
 export function writeTunnelState(state: TunnelState): TunnelState {
-  writeSecureJson(tunnelStateFile(state.workspaceId), state);
-  return state;
+  const lock = state.workspaceId === "installation"
+    ? acquireStateLock(path.join(getStateDir(), "runtime", "tunnel-state.lock"))
+    : null;
+  try {
+    writeSecureJson(tunnelStateFile(state.workspaceId), state);
+    return state;
+  } finally {
+    lock?.release();
+  }
 }
 
 export function needsTunnelChoice(state: TunnelState): boolean {

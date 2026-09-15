@@ -25,8 +25,9 @@ function accessibleFile(candidate: string): string | null {
 /** Locate a binary on PATH or in common install locations. */
 export function findBinary(name: string): string | null {
   const exe = process.platform === "win32" ? `${name}.exe` : name;
-  if (name === "cloudflared" && process.env.C2C_CLOUDFLARED_PATH?.trim()) {
-    const configured = accessibleFile(process.env.C2C_CLOUDFLARED_PATH.trim());
+  const configuredVariable = name === "cloudflared" ? "C2C_CLOUDFLARED_PATH" : name === "tunnel-client" ? "C2C_TUNNEL_CLIENT_PATH" : null;
+  if (configuredVariable && process.env[configuredVariable]?.trim()) {
+    const configured = accessibleFile(process.env[configuredVariable]!.trim());
     if (configured) return configured;
   }
   try {
@@ -49,12 +50,14 @@ export function findBinary(name: string): string | null {
 
 export interface TunnelBinaries {
   cloudflared: string | null;
+  tunnelClient: string | null;
   wrangler: string | null;
 }
 
 export function detectTunnelBinaries(): TunnelBinaries {
   return {
     cloudflared: findBinary("cloudflared"),
+    tunnelClient: findBinary("tunnel-client"),
     wrangler: findBinary("wrangler"),
   };
 }

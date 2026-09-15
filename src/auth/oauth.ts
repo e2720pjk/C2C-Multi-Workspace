@@ -11,7 +11,10 @@ export interface OAuthDeps {
   pairing: PairingManager;
   workspaceName: string;
   getBaseUrl: (req: Request) => string;
+  /** Override when the external MCP URL is already path-qualified (OpenAI tunnel). */
+  getResourceUrl?: (req: Request, base: string) => string;
   logger: Logger;
+  accessTokenTtlMs?: number;
 }
 
 interface PendingAuthRequest {
@@ -55,9 +58,9 @@ function authorizationServerMetadata(base: string): Record<string, unknown> {
   };
 }
 
-function protectedResourceMetadata(base: string): Record<string, unknown> {
+function protectedResourceMetadata(base: string, resource = `${base}/mcp`): Record<string, unknown> {
   return {
-    resource: `${base}/mcp`,
+    resource,
     authorization_servers: [base],
     scopes_supported: [...SUPPORTED_SCOPES],
     bearer_methods_supported: ["header"],
@@ -151,7 +154,8 @@ export function createOAuthRouter(deps: OAuthDeps): Router {
     res.json(authorizationServerMetadata(deps.getBaseUrl(req)));
   };
   const prMetadataHandler = (req: Request, res: Response): void => {
-    res.json(protectedResourceMetadata(deps.getBaseUrl(req)));
+    const base = deps.getBaseUrl(req);
+    res.json(protectedResourceMetadata(base, deps.getResourceUrl?.(req, base)));
   };
   router.get("/.well-known/oauth-authorization-server", asMetadataHandler);
   router.get("/.well-known/oauth-authorization-server/mcp", asMetadataHandler);
@@ -315,7 +319,11 @@ export function createOAuthRouter(deps: OAuthDeps): Router {
         res.status(400).json({ error: "invalid_grant", error_description: "PKCE verification failed" });
         return;
       }
-      const tokens = deps.store.issueTokens({ clientId, scopes: record.scopes });
+      const tokens = deps.store.issueTokens({
+        clientId,
+        scopes: record.scopes,
+        accessTtlMs: deps.accessTokenTtlMs,
+      });
       deps.logger.info(`Issued access token for client ${clientId}`);
       res.json({
         access_token: tokens.accessToken,

@@ -29,7 +29,9 @@
 | Oversized file / diff DoS | read_file caps lines and bytes per response; git_diff paginates by byte offset with hard caps; search caps matches and file sizes |
 | Tunnel exposure | Bridge binds 127.0.0.1 only (refuses 0.0.0.0); the only public surface is HTTPS via the one installation tunnel, protected by OAuth; `/health` reveals ids/health only |
 | Admin API abuse | Loopback-only + random admin token (0600 runtime file) + requests with proxy headers (`cf-connecting-ip`, `x-forwarded-for`) rejected; unauthenticated probes get 404 |
-| Log credential leakage | Logger redacts token prefixes, bearer headers, token-like parameters, and pairing-code-shaped strings before writing |
+| Log credential leakage | Logger redacts token prefixes, bearer headers, token-like parameters, and pairing-code-shaped strings before writing; the OpenAI runtime key is passed only through the tunnel-client environment and never persisted or put in argv |
+| OpenAI tunnel ownership | Installation owner lock and tunnel-client owner lock permit one verified process per installation; health/contract/build identity mismatches fail closed |
+| OpenAI tunnel administration | C2C accepts an existing Tunnel ID plus runtime `CONTROL_PLANE_API_KEY`; it never accepts or requires `OPENAI_ADMIN_KEY`, tunnel CRUD, or organization administration |
 | Execution output leak | Codex may nominate test/build/lint logs; a local sanitizer redacts tokens, pairing-code-shaped strings and home paths, truncates size, and refuses private-key blocks entirely. Restricted items are listed without a body. ChatGPT still cannot run commands. |
 | Checkpoint / resume dump | Session checkpoints store short protocol fields only (capped). Resume uses the existing chat or HANDOFF — no new protocol state, no log paste, no re-pairing. |
 

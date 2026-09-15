@@ -2,13 +2,15 @@ import express, { type Request, type Response, type NextFunction } from "express
 import type { Server } from "node:http";
 import { randomBytes } from "node:crypto";
 import path from "node:path";
+import { acquireStateLockAsync, type StateLock } from "../config/lock.js";
+import { ensureInstallationIdentity, rememberInstallationPort } from "../config/installation.js";
 import { Workspace } from "../workspace/manager.js";
 import {
   INSTALLATION_WORKSPACE_ID,
   WorkspaceRegistry,
   type WorkspaceRegistryOptions,
 } from "../workspace/registry.js";
-import { AuthStore } from "../auth/store.js";
+import { AuthStore, SUPPORTED_SCOPES } from "../auth/store.js";
 import { createOAuthRouter } from "../auth/oauth.js";
 import { bearerAuth } from "../auth/middleware.js";
 import { PairingManager } from "../pairing/manager.js";
@@ -16,15 +18,38 @@ import { createMcpServer } from "../mcp/server.js";
 import { createMcpHttpHandler } from "../mcp/http.js";
 import { CloudflaredQuickTunnel } from "../tunnel/cloudflared.js";
 import { CloudflaredNamedTunnel } from "../tunnel/cloudflared-named.js";
+import { OpenAiSecureTunnel, type TunnelAuthorization } from "../tunnel/openai-secure.js";
 import type { TunnelProvider } from "../tunnel/provider.js";
 import { namedTunnelBinding, readInstallationTunnelState } from "../tunnel/state.js";
 import { Logger, nullLogger } from "../logger/index.js";
 import { DEFAULT_HOST, DEFAULT_PORT, getStateDir } from "../config/paths.js";
-import { SERVICE_NAME, VERSION } from "../version.js";
-import { writeRuntimeState, clearRuntimeState, type RuntimeState } from "./runtime.js";
+import { RUNTIME_BUILD_ID, RUNTIME_CONTRACT_ID, SERVICE_NAME, VERSION } from "../version.js";
+import {
+  writeRuntimeState,
+  clearInstallationRuntime,
+  clearRuntimeState,
+  type RuntimeState,
+} from "./runtime.js";
 
-function tunnelForInstallation(defaultWorkspaceId: string, logger: Logger): TunnelProvider {
-  const binding = namedTunnelBinding(readInstallationTunnelState(defaultWorkspaceId));
+function tunnelForInstallation(
+  defaultWorkspaceId: string,
+  logger: Logger,
+  mcpAuthorization?: () => TunnelAuthorization | Promise<TunnelAuthorization>
+): TunnelProvider {
+  const state = readInstallationTunnelState(defaultWorkspaceId);
+  const openaiConfigured = Boolean(process.env.CONTROL_PLANE_TUNNEL_ID && process.env.CONTROL_PLANE_API_KEY);
+  if (
+    state.preference === "openai" ||
+    (state.preference === "unset" &&
+      (process.env.C2C_TUNNEL_PROVIDER?.trim().toLowerCase() === "openai" || openaiConfigured))
+  ) {
+    return new OpenAiSecureTunnel({
+      logger,
+      tunnelId: process.env.CONTROL_PLANE_TUNNEL_ID?.trim() || state.tunnelId,
+      mcpAuthorization,
+    });
+  }
+  const binding = namedTunnelBinding(state);
   if (binding) {
     return new CloudflaredNamedTunnel({
       tunnelName: binding.tunnelName,
@@ -61,6 +86,7 @@ export interface Bridge {
   registry: WorkspaceRegistry;
   port: number;
   host: string;
+  installationId?: string;
   adminToken: string;
   authStore: AuthStore;
   pairing: PairingManager;
@@ -119,18 +145,46 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
     } satisfies WorkspaceRegistryOptions);
   for (const root of roots) registry.register(root);
   if (opts.defaultWorkspace !== undefined) registry.setDefault(opts.defaultWorkspace);
-  const workspace = registry.resolve();
+  const workspace = opts.defaultWorkspace !== undefined ? registry.resolve(opts.defaultWorkspace) : registry.primary();
+  const ownsInstallation = opts.persistRuntime !== false;
+  const installationId = ownsInstallation ? ensureInstallationIdentity().installationId : undefined;
   const authStore = new AuthStore(legacySingle ? workspace.id : INSTALLATION_WORKSPACE_ID, {
     file:
       opts.authStoreFile ??
       path.join(getStateDir(), "auth", `${legacySingle ? workspace.id : "installation"}.json`),
   });
+  const tunnelTokenTtlMs = Math.max(1_000, opts.accessTokenTtlMs ?? 5 * 60 * 1_000);
+  let tunnelAuthorization: { raw: string; value: string; expiresAt: number } | null = null;
+  const getTunnelAuthorization = (): TunnelAuthorization => {
+    const refreshAt = Date.now() + 30_000;
+    if (tunnelAuthorization && tunnelAuthorization.expiresAt > refreshAt) {
+      return { value: tunnelAuthorization.value, expiresAt: tunnelAuthorization.expiresAt };
+    }
+    if (tunnelAuthorization) authStore.revokeToken(tunnelAuthorization.raw);
+    const issued = authStore.issueTokens({
+      clientId: "c2c-openai-tunnel",
+      scopes: [...SUPPORTED_SCOPES].filter((scope) => scope !== "offline_access"),
+      accessTtlMs: tunnelTokenTtlMs,
+    });
+    tunnelAuthorization = {
+      raw: issued.accessToken,
+      value: `Bearer ${issued.accessToken}`,
+      expiresAt: Date.now() + tunnelTokenTtlMs,
+    };
+    return { value: tunnelAuthorization.value, expiresAt: tunnelAuthorization.expiresAt };
+  };
+  const clearTunnelAuthorization = (): void => {
+    if (tunnelAuthorization) authStore.revokeToken(tunnelAuthorization.raw);
+    tunnelAuthorization = null;
+  };
   const pairing = new PairingManager(INSTALLATION_WORKSPACE_ID, { ttlMs: opts.pairingTtlMs });
   // One provider belongs to the bridge/installation, never to a tool call.
-  const tunnel = opts.tunnelProvider ?? tunnelForInstallation(workspace.id, logger);
+  const tunnel =
+    opts.tunnelProvider ?? tunnelForInstallation(workspace.id, logger, getTunnelAuthorization);
   const adminToken = `c2c_admin_${randomBytes(24).toString("base64url")}`;
 
   let publicBaseUrl: string | null = null;
+  let closed = false;
   const app = express();
   app.set("trust proxy", true);
   app.disable("x-powered-by");
@@ -141,20 +195,33 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
     const hostHeader = req.get("host") ?? `${host}:${port}`;
     return `${proto}://${hostHeader}`;
   };
+  const pathQualifiedPublicUrl = (): boolean => tunnel.name === "openai-secure" && publicBaseUrl !== null;
 
   const registrySnapshot = (): { workspaceId: string; workspaceIds: string[]; defaultWorkspaceId: string | null } => {
     const current = registry.list();
+    const defaultId = registry.defaultWorkspaceId();
+    const fallback = current.find((item) => item.workspaceId === workspace.id) ?? current[0];
     return {
-      workspaceId: registry.defaultWorkspaceId() ?? workspace.id,
+      workspaceId: defaultId ?? fallback?.workspaceId ?? workspace.id,
       workspaceIds: current.map((item) => item.workspaceId),
-      defaultWorkspaceId: registry.defaultWorkspaceId(),
+      defaultWorkspaceId: defaultId,
     };
   };
 
   // ---- Health (public but minimal) ---------------------------------------
 
   app.get("/health", (_req, res) => {
-    res.json({ service: SERVICE_NAME, version: VERSION, ...registrySnapshot(), status: "ok" });
+    res.json({
+      service: SERVICE_NAME,
+      version: VERSION,
+      contractId: RUNTIME_CONTRACT_ID,
+      buildId: RUNTIME_BUILD_ID,
+      installationId,
+      pid: process.pid,
+      port,
+      ...registrySnapshot(),
+      status: "ok",
+    });
   });
 
   // ---- OAuth + discovery -------------------------------------------------
@@ -165,6 +232,7 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
       pairing,
       workspaceName: legacySingle ? workspace.name : "C2C installation",
       getBaseUrl,
+      getResourceUrl: (_req, base) => (pathQualifiedPublicUrl() ? base : `${base}/mcp`),
       logger,
     })
   );
@@ -217,10 +285,15 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
   });
 
   app.get("/admin/info", adminGuard, (_req, res) => {
+    const snapshot = registrySnapshot();
+    persistRuntime();
     res.json({
       service: SERVICE_NAME,
       version: VERSION,
-      ...registrySnapshot(),
+      contractId: RUNTIME_CONTRACT_ID,
+      buildId: RUNTIME_BUILD_ID,
+      installationId,
+      ...snapshot,
       workspaceName: workspace.name,
       workspaceRoot: workspace.root,
       workspaces: registry.summaries(),
@@ -235,36 +308,63 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
   });
 
   app.get("/admin/workspaces", adminGuard, (_req, res) => {
+    persistRuntime();
     res.json({ workspaces: registry.summaries() });
   });
 
+  let tunnelOperation: Promise<unknown> = Promise.resolve();
+  const withTunnelOperation = <T>(operation: () => Promise<T>): Promise<T> => {
+    const next = tunnelOperation.then(operation);
+    tunnelOperation = next.then(() => undefined, () => undefined);
+    return next;
+  };
+
   app.post("/admin/tunnel/start", adminGuard, (_req, res) => {
-    tunnel
-      .start(port)
-      .then((url) => {
-        publicBaseUrl = url;
-        persistRuntime();
-        res.json({ url });
-      })
+    void withTunnelOperation(async () => {
+      if (closed) throw new Error("Bridge is shutting down.");
+      const status = tunnel.status();
+      const url = status.running ? (status.url ?? tunnel.getPublicUrl()) : await tunnel.start(port);
+      publicBaseUrl = url;
+      persistRuntime();
+      return url;
+    })
+      .then((url) => res.json({ url }))
       .catch((error: Error) => {
+        clearTunnelAuthorization();
         logger.error(`Tunnel start failed: ${error.message}`);
         res.status(500).json({ error: "tunnel_failed", message: error.message });
       });
   });
 
   app.post("/admin/tunnel/stop", adminGuard, (_req, res) => {
-    void tunnel.stop().then(() => {
+    void withTunnelOperation(async () => {
+      if (tunnel.status().running) await tunnel.stop();
+      clearTunnelAuthorization();
       publicBaseUrl = null;
       persistRuntime();
-      res.json({ stopped: true });
-    });
+    })
+      .then(() => res.json({ stopped: true }))
+      .catch((error: Error) => res.status(500).json({ error: "tunnel_failed", message: error.message }));
   });
 
   app.post("/admin/revoke-all", adminGuard, (_req, res) => {
     const count = authStore.revokeAll();
     pairing.invalidateAll();
-    logger.info(`Revoked all tokens (${count})`);
-    res.json({ revoked: count });
+    clearTunnelAuthorization();
+    const operation =
+      tunnel.name === "openai-secure" && tunnel.status().running
+        ? withTunnelOperation(async () => {
+            const url = await tunnel.restart(port);
+            publicBaseUrl = url;
+            persistRuntime();
+          })
+        : Promise.resolve();
+    void operation
+      .then(() => {
+        logger.info(`Revoked all tokens (${count})`);
+        res.json({ revoked: count });
+      })
+      .catch((error: Error) => res.status(500).json({ error: "tunnel_failed", message: error.message }));
   });
 
   app.post("/admin/shutdown", adminGuard, (_req, res) => {
@@ -274,14 +374,26 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
     }, 100);
   });
 
-  const { server, port } = await listen(app, host, opts.port ?? DEFAULT_PORT);
+  let ownerLock: StateLock | null = null;
+  if (ownsInstallation) {
+    ownerLock = await acquireStateLockAsync(path.join(getStateDir(), "runtime", "installation-owner.lock"), { timeoutMs: 250 });
+  }
+
+  let server: Server;
+  let port: number;
+  try {
+    ({ server, port } = await listen(app, host, opts.port ?? DEFAULT_PORT));
+  } catch (error) {
+    ownerLock?.release();
+    throw error;
+  }
   const startedAt = new Date().toISOString();
   logger.info(`Bridge listening on ${host}:${port} for ${registry.list().length} registered workspace(s)`);
 
   const persistRuntime = (): void => {
     if (opts.persistRuntime === false) return;
     const current = registry.list();
-    const defaultId = registry.defaultWorkspaceId() ?? workspace.id;
+    const defaultId = registry.defaultWorkspaceId() ?? current[0]?.workspaceId ?? workspace.id;
     const defaultRecord = current.find((item) => item.workspaceId === defaultId) ?? current[0];
     const state: RuntimeState = {
       service: SERVICE_NAME,
@@ -290,7 +402,10 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
       workspaceRoot: defaultRecord?.root ?? workspace.root,
       workspaceIds: legacySingle ? undefined : current.map((item) => item.workspaceId),
       defaultWorkspaceId: legacySingle ? undefined : registry.defaultWorkspaceId(),
-      installationId: legacySingle ? undefined : INSTALLATION_WORKSPACE_ID,
+      installationId: legacySingle ? undefined : installationId,
+      contractId: legacySingle ? undefined : RUNTIME_CONTRACT_ID,
+      buildId: legacySingle ? undefined : RUNTIME_BUILD_ID,
+      ownerToken: legacySingle ? undefined : ownerLock?.owner.token,
       pid: process.pid,
       port,
       adminToken,
@@ -299,15 +414,28 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
     };
     writeRuntimeState(state);
   };
-  persistRuntime();
+  try {
+    if (ownsInstallation) rememberInstallationPort(port);
+    persistRuntime();
+  } catch (error) {
+    ownerLock?.release();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    throw error;
+  }
 
-  let closed = false;
   const shutdown = async (): Promise<void> => {
     if (closed) return;
     closed = true;
-    await tunnel.stop().catch(() => undefined);
+    // Do not release the installation owner while a tunnel child may still be alive.
+    await withTunnelOperation(() => tunnel.stop()).catch((error: Error) => {
+      logger.error(`Tunnel stop failed during shutdown: ${error.message}`);
+    });
+    clearTunnelAuthorization();
     await new Promise<void>((resolve) => server.close(() => resolve()));
-    if (opts.persistRuntime !== false) clearRuntimeState(workspace.id);
+    if (ownsInstallation) clearInstallationRuntime();
+    else clearRuntimeState(workspace.id);
+    ownerLock?.release();
+    ownerLock = null;
     logger.info("Bridge stopped");
   };
 
@@ -316,6 +444,7 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
     registry,
     port,
     host,
+    installationId,
     adminToken,
     authStore,
     pairing,

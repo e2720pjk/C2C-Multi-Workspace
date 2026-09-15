@@ -84,6 +84,22 @@ The Skill installs this automatically during setup.
 If cloudflared is installed in a custom location that is not on `PATH`, set
 `C2C_CLOUDFLARED_PATH` to the executable's absolute path before running `c2c`.
 
+### OpenAI Secure Tunnel is not ready
+Provision the Tunnel outside C2C, then set only its existing id and runtime key:
+
+```bash
+export CONTROL_PLANE_TUNNEL_ID=tunnel_...
+export CONTROL_PLANE_API_KEY=...
+c2c tunnel choose --mode openai
+c2c start --tunnel
+```
+
+Install the official `tunnel-client` binary or set `C2C_TUNNEL_CLIENT_PATH`.
+C2C does not create/delete OpenAI Tunnel objects and never needs
+`OPENAI_ADMIN_KEY`. `c2c doctor` reports `/readyz` failures and safely retries a
+single installation-owned client; it does not start a second client for a
+second workspace.
+
 ### Every new Codex chat “repairs” the connection / cannot write logs
 The C2C state directory lives outside the project (macOS:
 `~/Library/Application Support/codex-with-chatgpt`; Windows:
@@ -98,7 +114,10 @@ do not need elevation.
 ### Port already in use
 Handled automatically: an existing healthy installation bridge serving the
 registered workspace is reused; adding another registered root does not start
-another bridge or tunnel. Anything else makes the bridge pick a free port.
+another bridge or tunnel. If a non-C2C process occupies the preferred port, the
+single installation owner picks a free port. If ownership or compatibility is
+unknown, C2C reports a conflict instead of killing a PID or starting a second
+daemon.
 
 ### Reading a file returns ACCESS_DENIED_SENSITIVE_FILE
 Working as intended: `.env`, keys, credentials and anything matched by
@@ -117,10 +136,14 @@ long-chat instead. Each workspace may have its own Project/conversation, but all
 workspaces use the installation connector.
 
 ### Completely stuck
-```
+If `c2c status --json` reports a healthy or stopped installation:
+
+```bash
 c2c stop
 c2c setup
 ```
 
-re-creates the bridge, tunnel and pairing session from scratch. Existing
-authorizations stay valid unless you also ran `c2c unpair`.
+This recreates the bridge, tunnel and pairing session from scratch. If it
+reports `unknown`/`conflicting`, do not kill the reported PID: inspect
+`c2c logs --verbose` and repair the ownership/compatibility conflict first.
+Existing authorizations stay valid unless you also ran `c2c unpair`.

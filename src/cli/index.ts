@@ -4,7 +4,8 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { startBridge } from "../bridge/server.js";
-import { findBridgeObservation, findLiveBridge, type RuntimeState } from "../bridge/runtime.js";
+import { findInstallationObservation, type RuntimeState } from "../bridge/runtime.js";
+import { readInstallationIdentity } from "../config/installation.js";
 import { adminFetch, ensureBridge, stopBridge } from "../process/daemon.js";
 import { Workspace } from "../workspace/manager.js";
 import { INSTALLATION_WORKSPACE_ID, WorkspaceRegistry } from "../workspace/registry.js";
@@ -23,6 +24,7 @@ import {
   NAMED_REPAIR_MESSAGE,
   needsTunnelChoice,
   readInstallationTunnelState,
+  writeTunnelState,
   TUNNEL_CHOICE_PROMPT,
 } from "../tunnel/state.js";
 import { Logger } from "../logger/index.js";
@@ -42,7 +44,7 @@ import {
   writeLastEndpoint,
   type LastEndpoint,
 } from "../config/endpoint.js";
-import { PRODUCT_NAME, VERSION } from "../version.js";
+import { PRODUCT_NAME, RUNTIME_BUILD_ID, RUNTIME_CONTRACT_ID, VERSION } from "../version.js";
 import {
   clearChatPointer,
   mergeSession,
@@ -68,6 +70,26 @@ const cross = (msg: string): void => say(`✗ ${msg}`);
 
 function resolveWorkspace(option?: string): string {
   return path.resolve(option ?? process.cwd());
+}
+
+function runtimeCompatibility(): {
+  expectedInstallationId: string;
+  expectedContractId: string;
+  expectedBuildId: string;
+} {
+  let identity: ReturnType<typeof readInstallationIdentity> = null;
+  try {
+    identity = readInstallationIdentity();
+  } catch {
+    // Corrupt identity state must not become a wildcard that can reuse a daemon.
+    identity = { version: 1, installationId: "corrupt-installation-identity", createdAt: "" };
+  }
+  return {
+    // A missing or corrupt identity is not proof that an active daemon belongs to this CLI.
+    expectedInstallationId: identity?.installationId ?? "missing-installation-identity",
+    expectedContractId: RUNTIME_CONTRACT_ID,
+    expectedBuildId: RUNTIME_BUILD_ID,
+  };
 }
 
 const INSTALLATION_ENDPOINT_ID = INSTALLATION_WORKSPACE_ID;
@@ -118,6 +140,11 @@ function readCappedUtf8(filePath: string, maxBytes: number): string {
   }
 }
 
+function mcpUrlForTunnel(info: Pick<AdminInfo, "publicUrl" | "tunnel">): string | null {
+  if (!info.publicUrl) return null;
+  return info.tunnel.provider === "openai-secure" ? info.publicUrl : `${info.publicUrl}/mcp`;
+}
+
 function persistWorkspaceEndpoint(opts: {
   workspaceId: string;
   workspaceName: string;
@@ -145,17 +172,23 @@ function persistWorkspaceEndpoint(opts: {
 
 function tunnelChoicePayload(workspace: Workspace, zoneHint?: string): Record<string, unknown> {
   const state = readInstallationTunnelState(workspace.id);
+  const binaries = detectTunnelBinaries();
+  const openaiConfigured = Boolean(process.env.CONTROL_PLANE_TUNNEL_ID && process.env.CONTROL_PLANE_API_KEY);
+  const openaiSelected = state.preference === "openai" || (state.preference === "unset" && openaiConfigured);
   const zone = parseZoneInput(zoneHint ?? "") ?? state.zone ?? null;
   return {
     ok: true,
-    needsChoice: needsTunnelChoice(state),
-    preference: state.preference,
+    needsChoice: needsTunnelChoice(state) && !openaiConfigured,
+    preference: openaiSelected ? "openai" : state.preference,
+    provider: openaiSelected ? "openai-secure" : state.provider ?? null,
     loggedIn: hasCloudflaredCert(),
+    openaiConfigured,
+    tunnelClientFound: binaries.tunnelClient !== null,
     namedReady: isNamedTunnelReady(state),
     zone,
     hostname: state.hostname ?? null,
     suggestedHostname: zone ? suggestedNamedHostname(zone, PRODUCT_NAME, INSTALLATION_ENDPOINT_ID) : null,
-    userPrompt: needsTunnelChoice(state) ? TUNNEL_CHOICE_PROMPT : undefined,
+    userPrompt: needsTunnelChoice(state) && !openaiConfigured ? TUNNEL_CHOICE_PROMPT : undefined,
     loginPrompt: NAMED_LOGIN_PROMPT,
     fallbackReason: state.fallbackReason,
   };
@@ -173,7 +206,7 @@ function trySandboxAllow():
 }
 
 interface TunnelStartResponse {
-  url?: string;
+  url?: string | null;
   error?: string;
   message?: string;
 }
@@ -184,6 +217,11 @@ interface PairingResponse {
 }
 
 interface AdminInfo {
+  service?: string;
+  version?: string;
+  contractId?: string;
+  buildId?: string;
+  installationId?: string;
   workspaceId: string;
   workspaceIds?: string[];
   defaultWorkspaceId?: string | null;
@@ -206,18 +244,21 @@ async function ensureBridgeAndTunnel(
   const targetWorkspace = new Workspace(workspaceRoot);
   const { runtime } = await ensureBridge(targetWorkspace.root);
   let info = await adminFetch<AdminInfo>(runtime, "GET", "/admin/info");
-  let mcpUrl: string | null = info.publicUrl ? `${info.publicUrl}/mcp` : null;
-  if (opts.tunnel && !info.publicUrl) {
+  let mcpUrl: string | null = mcpUrlForTunnel(info);
+  if (opts.tunnel && !info.tunnel.running) {
     const binaries = detectTunnelBinaries();
-    if (!binaries.cloudflared) {
+    if (info.tunnel.provider === "openai-secure") {
+      if (!binaries.tunnelClient) {
+        throw new Error("NEED_OPENAI_TUNNEL_CLIENT: official tunnel-client is not installed or not on PATH.");
+      }
+    } else if (!binaries.cloudflared) {
       throw new Error(
         "NEED_CLOUDFLARED: cloudflared is not installed. Install it first (macOS: brew install cloudflared)."
       );
     }
-    const result = await adminFetch<TunnelStartResponse>(runtime, "POST", "/admin/tunnel/start", 90_000);
-    if (!result.url) throw new Error(result.message ?? "Tunnel start failed");
+    await adminFetch<TunnelStartResponse>(runtime, "POST", "/admin/tunnel/start", 90_000);
     info = await adminFetch<AdminInfo>(runtime, "GET", "/admin/info");
-    mcpUrl = `${result.url}/mcp`;
+    mcpUrl = mcpUrlForTunnel(info);
   }
   return { runtime, info, mcpUrl, workspace: targetWorkspace };
 }
@@ -278,12 +319,13 @@ program
           })
         : previousInstallationEndpoint(info.workspaceId)?.connectorName;
       if (opts.json) {
-        say(JSON.stringify({ ok: true, port: runtime.port, workspaceId: targetWorkspace.id, workspaceName: targetWorkspace.name, mcpUrl, connectorName }));
+        say(JSON.stringify({ ok: true, port: runtime.port, workspaceId: targetWorkspace.id, workspaceName: targetWorkspace.name, mcpUrl, connectorName, tunnelProvider: info.tunnel.provider }));
         return;
       }
       check(`当前项目已识别（${targetWorkspace.name}）`);
       check("Workspace Bridge 已启动");
       if (mcpUrl) check("安全连接已建立");
+      else if (info.tunnel.provider === "openai-secure" && info.tunnel.running) check("OpenAI Secure Tunnel 已连接");
     } catch (error) {
       handleCliError(error, opts.json);
     }
@@ -332,14 +374,16 @@ program
             workspaceId: targetWorkspace.id,
             workspaceName: targetWorkspace.name,
             connectorName,
-            mcpUrl: mcpUrl ?? `http://127.0.0.1:${runtime.port}/mcp`,
-            local: mcpUrl === null,
+            mcpUrl,
+            local: mcpUrl === null && info.tunnel.provider !== "openai-secure",
             pairingCode: pairingResult.code,
             pairingExpiresAt: pairingResult.expiresAt,
             sandbox,
             tunnel: {
-              mode: isNamedTunnelReady(tunnelState) ? "named" : "quick",
+              provider: info.tunnel.provider,
+              mode: info.tunnel.provider === "openai-secure" ? "openai" : isNamedTunnelReady(tunnelState) ? "named" : "quick",
               hostname: tunnelState.hostname ?? null,
+              running: info.tunnel.running,
               fallback: Boolean(tunnelState.fallbackReason),
             },
           })
@@ -349,8 +393,11 @@ program
       check(`当前项目已识别（${targetWorkspace.name}）`);
       check("Workspace Bridge 已启动");
       if (mcpUrl) check("安全连接已建立");
+      else if (info.tunnel.provider === "openai-secure" && info.tunnel.running) check("OpenAI Secure Tunnel 已连接");
       say("");
-      say(`连接地址：${mcpUrl ?? `http://127.0.0.1:${runtime.port}/mcp`}`);
+      if (mcpUrl) say(`连接地址：${mcpUrl}`);
+      else if (info.tunnel.provider === "openai-secure") say("连接方式：OpenAI Secure Tunnel（使用已配置的 Tunnel ID）");
+      else say(`本地地址：http://127.0.0.1:${runtime.port}/mcp`);
       say(`配对码：${pairingResult.code}（${Math.round((pairingResult.expiresAt - Date.now()) / 60000)} 分钟内有效）`);
       say("");
       say("下一步：在 ChatGPT 的连接器设置中添加以上地址（OAuth），并在授权页输入配对码。");
@@ -366,8 +413,8 @@ program
   .command("stop")
   .description("Stop the installation bridge")
   .option("-w, --workspace <path>")
-  .action(async (opts: { workspace?: string }) => {
-    const stopped = await stopBridge(resolveWorkspace(opts.workspace));
+  .action(async () => {
+    const stopped = await stopBridge();
     if (stopped) check("Bridge 已停止");
     else say("没有正在运行的 Bridge。");
   });
@@ -379,7 +426,7 @@ program
   .option("--tunnel", "re-establish the secure public connection", false)
   .action(async (opts: { workspace?: string; tunnel: boolean }) => {
     const root = resolveWorkspace(opts.workspace);
-    await stopBridge(root);
+    await stopBridge();
     await new Promise((resolve) => setTimeout(resolve, 500));
     try {
       const { mcpUrl, workspace: targetWorkspace } = await ensureBridgeAndTunnel(root, { tunnel: opts.tunnel });
@@ -400,31 +447,73 @@ program
   .action(async (opts: { workspace?: string; json: boolean }) => {
     const root = resolveWorkspace(opts.workspace);
     const workspace = new Workspace(root);
-    const observation = await findBridgeObservation(workspace.id);
+    const observation = await findInstallationObservation(undefined, runtimeCompatibility());
     if (observation.state === "unknown") {
       if (opts.json) {
-        say(JSON.stringify({ ok: false, running: null, state: "unknown", reason: observation.reason }));
+        say(
+          JSON.stringify({
+            ok: false,
+            running: null,
+            compatible: false,
+            state: "unknown",
+            reason: observation.reason,
+            expectedContractId: RUNTIME_CONTRACT_ID,
+            expectedBuildId: RUNTIME_BUILD_ID,
+          })
+        );
       } else {
         cross(`Bridge 状态无法确认（${observation.reason}），未将其视为未运行。`);
       }
       return;
     }
     if (observation.state === "stopped") {
-      if (opts.json) say(JSON.stringify({ ok: false, running: false }));
-      else say("Bridge 未运行。使用 `c2c start` 启动。");
+      const registry = new WorkspaceRegistry();
+      const registered = registry.summaries().find((item) => item.workspaceId === workspace.id);
+      const stopped = {
+        ok: false,
+        running: false,
+        currentWorkspace: {
+          workspaceId: workspace.id,
+          displayName: workspace.name,
+          registered: Boolean(registered),
+          enabled: registered?.enabled ?? false,
+          available: registered?.available ?? true,
+        },
+        registeredWorkspaceCount: registry.list().length,
+      };
+      if (opts.json) say(JSON.stringify(stopped));
+      else {
+        say(`当前 workspace：${workspace.name}（${registered ? "已注册" : "未注册"}）`);
+        say("Bridge 未运行。使用 `c2c start` 启动。");
+      }
       return;
     }
     const runtime = observation.runtime;
     const info = await adminFetch<AdminInfo>(runtime, "GET", "/admin/info");
+    const currentWorkspace = info.workspaces?.find((item) => item.workspaceId === workspace.id) ?? null;
+    const status = {
+      ok: true,
+      running: true,
+      compatible: true,
+      currentWorkspace: {
+        workspaceId: workspace.id,
+        displayName: workspace.name,
+        registered: currentWorkspace !== null,
+        enabled: currentWorkspace?.enabled ?? false,
+        available: currentWorkspace?.available ?? true,
+      },
+      registeredWorkspaceCount: info.workspaces?.length ?? info.workspaceIds?.length ?? 0,
+      ...info,
+    };
     if (opts.json) {
-      say(JSON.stringify({ ok: true, running: true, ...info }));
+      say(JSON.stringify(status));
       return;
     }
     say(PRODUCT_NAME);
     say("");
-    check(`Workspace：${info.workspaceName}`);
+    check(`当前 workspace：${workspace.name}（${currentWorkspace ? "已注册" : "未注册"}）`);
     check(`Bridge：运行中（端口 ${info.port}）`);
-    if (info.tunnel.running && info.tunnel.url) check(`安全连接：${info.tunnel.url}/mcp`);
+    if (info.tunnel.running && info.tunnel.url) check(`安全连接：${mcpUrlForTunnel(info)}`);
     else say("· 安全连接：未启用（本地模式）");
     say(`· 已授权连接：${info.tokenCount > 0 ? "是" : "否"}`);
   });
@@ -479,7 +568,7 @@ program
     let runtime: RuntimeState | null = null;
     let bridgeUnknown = false;
     if (workspace) {
-      const observation = await findBridgeObservation(workspace.id);
+      const observation = await findInstallationObservation(undefined, runtimeCompatibility());
       if (observation.state === "healthy") {
         runtime = observation.runtime;
       } else if (observation.state === "unknown") {
@@ -558,7 +647,7 @@ program
     if (runtime) {
       let info = await adminFetch<AdminInfo>(runtime, "GET", "/admin/info");
       if (namedReady && opts.fix && info.tunnel.provider !== "cloudflare-named") {
-        await stopBridge(root);
+        await stopBridge();
         await new Promise((resolve) => setTimeout(resolve, 400));
         try {
           runtime = (await ensureBridge(root)).runtime;
@@ -568,10 +657,11 @@ program
           report.tunnel = { ok: false, detail: (error as Error).message };
         }
       }
-      const expectedPublic = Boolean(lastEndpoint?.publicUrl) || namedReady;
+      const openAiTunnel = info.tunnel.provider === "openai-secure";
+      const expectedPublic = Boolean(lastEndpoint?.publicUrl) || namedReady || openAiTunnel;
       let currentUrl = info.publicUrl ?? info.tunnel.url;
-      let healthy = false;
-      if (currentUrl) {
+      let healthy = openAiTunnel ? info.tunnel.running : false;
+      if (currentUrl && !openAiTunnel) {
         try {
           const response = await fetch(`${currentUrl}/health`, { signal: AbortSignal.timeout(8000) });
           healthy = response.ok;
@@ -583,17 +673,18 @@ program
       if ((!currentUrl || !healthy) && opts.fix && (expectedPublic || info.tunnel.running)) {
         try {
           const binaries = detectTunnelBinaries();
-          if (!binaries.cloudflared) {
-            report.tunnel = { ok: false, detail: "NEED_CLOUDFLARED" };
+          const missing = openAiTunnel ? !binaries.tunnelClient : !binaries.cloudflared;
+          if (missing) {
+            report.tunnel = { ok: false, detail: openAiTunnel ? "NEED_OPENAI_TUNNEL_CLIENT" : "NEED_CLOUDFLARED" };
           } else {
             const started = await adminFetch<TunnelStartResponse>(runtime, "POST", "/admin/tunnel/start", 90_000);
             if (started.url) {
               const previousUrl = lastEndpoint?.publicUrl;
-              currentUrl = started.url;
-              healthy = true;
               info = await adminFetch<AdminInfo>(runtime, "GET", "/admin/info");
+              currentUrl = info.publicUrl ?? started.url;
+              healthy = openAiTunnel ? info.tunnel.running : true;
               const sameAddress =
-                previousUrl && normalizePublicUrl(previousUrl) === normalizePublicUrl(started.url);
+                previousUrl && normalizePublicUrl(previousUrl) === normalizePublicUrl(currentUrl);
               results.push(sameAddress ? "已重新建立安全连接" : "已重新建立安全连接（地址已更换）");
             }
           }
@@ -604,7 +695,7 @@ program
 
       if (currentUrl && healthy) {
         report.tunnel = { ok: true, detail: currentUrl };
-        const nextMcp = mcpUrlFromPublic(currentUrl);
+        const nextMcp = openAiTunnel ? currentUrl : mcpUrlFromPublic(currentUrl);
         const action = connectorAction(lastEndpoint?.mcpUrl, nextMcp);
         const boundName = nextMcp
           ? persistWorkspaceEndpoint({
@@ -741,14 +832,15 @@ program
   .action(async (opts: { workspace?: string }) => {
     const root = resolveWorkspace(opts.workspace);
     const workspace = new Workspace(root);
-    const runtime = await findLiveBridge(workspace.id);
+    const installation = await findInstallationObservation(undefined, runtimeCompatibility());
+    const runtime = installation.state === "healthy" ? installation.runtime : null;
     if (runtime) {
       await adminFetch(runtime, "POST", "/admin/revoke-all");
     } else {
       // bridge not running: revoke the installation-wide persisted store
       new AuthStore(INSTALLATION_ENDPOINT_ID).revokeAll();
     }
-    check("已断开 ChatGPT 对当前项目的访问（所有令牌已吊销）");
+    check("已断开 ChatGPT 对此 C2C installation 的访问（所有令牌已吊销）");
   });
 
 // ---------------------------------------------------------------- logs / workspace / record
@@ -762,6 +854,7 @@ program
   .action((opts: { workspace?: string; lines: string; verbose: boolean }) => {
     const workspace = new Workspace(resolveWorkspace(opts.workspace));
     const candidates = [
+      path.join(getStateDir(), "logs", "bridge-installation.out.log"),
       path.join(getStateDir(), "logs", "bridge.log"),
       path.join(getStateDir(), "logs", `bridge-${workspace.id}.out.log`),
     ];
@@ -849,7 +942,7 @@ for (const commandName of ["add", "register"]) {
 }
 
 function workspaceMutationCommand(
-  name: "enable" | "disable" | "remove" | "set-default",
+  name: "enable" | "disable" | "remove" | "set-default" | "default",
   description: string,
   mutate: (registry: WorkspaceRegistry, selector: string) => unknown
 ): void {
@@ -878,6 +971,7 @@ workspaceMutationCommand("enable", "Enable a registered workspace", (registry, s
 workspaceMutationCommand("disable", "Disable a registered workspace", (registry, selector) => registry.setEnabled(selector, false));
 workspaceMutationCommand("remove", "Remove a workspace from this installation", (registry, selector) => registry.remove(selector));
 workspaceMutationCommand("set-default", "Choose the default workspace", (registry, selector) => registry.setDefault(selector));
+workspaceMutationCommand("default", "Choose the default workspace", (registry, selector) => registry.setDefault(selector));
 
 // ---------------------------------------------------------------- sandbox-allow (Codex writable_roots, macOS + Windows)
 
@@ -1234,6 +1328,7 @@ tunnelCmd
         return;
       }
       if (payload.needsChoice) say(TUNNEL_CHOICE_PROMPT);
+      else if (payload.provider === "openai-secure") check("OpenAI Secure Tunnel");
       else if (payload.namedReady) check(`固定域名：${payload.hostname}`);
       else say("当前使用临时地址。");
     } catch (error) {
@@ -1243,8 +1338,8 @@ tunnelCmd
 
 tunnelCmd
   .command("choose")
-  .description("Remember quick vs named, and provision a named hostname when asked")
-  .requiredOption("--mode <mode>", "quick or named")
+  .description("Remember quick, named, or OpenAI Secure Tunnel")
+  .requiredOption("--mode <mode>", "quick, named, or openai")
   .option("-w, --workspace <path>")
   .option("--zone <domain>", "Cloudflare domain for a named hostname")
   .option("--hostname <hostname>", "override the default installation hostname")
@@ -1257,16 +1352,36 @@ tunnelCmd
       const previous = readInstallationTunnelState(workspace.id);
       if (mode === "quick") {
         const state = chooseQuickTunnel(INSTALLATION_ENDPOINT_ID);
-        if (await findLiveBridge(workspace.id)) {
-          if (previous.preference === "named") await stopBridge(root);
+        if ((await findInstallationObservation(undefined, runtimeCompatibility())).state === "healthy") {
+          if (previous.preference !== "quick") await stopBridge();
         }
         const payload = { ...tunnelChoicePayload(workspace), state };
         if (opts.json) say(JSON.stringify(payload));
         else check("已选用临时地址");
         return;
       }
+      if (mode === "openai") {
+        if (!process.env.CONTROL_PLANE_TUNNEL_ID || !process.env.CONTROL_PLANE_API_KEY) {
+          throw new Error("OpenAI Secure Tunnel requires CONTROL_PLANE_TUNNEL_ID and CONTROL_PLANE_API_KEY.");
+        }
+        const state = writeTunnelState({
+          workspaceId: INSTALLATION_ENDPOINT_ID,
+          preference: "openai",
+          provider: "openai-secure",
+          tunnelId: process.env.CONTROL_PLANE_TUNNEL_ID,
+          askedAt: new Date().toISOString(),
+          configuredAt: new Date().toISOString(),
+        });
+        if ((await findInstallationObservation(undefined, runtimeCompatibility())).state === "healthy") {
+          await stopBridge();
+        }
+        const payload = { ...tunnelChoicePayload(workspace), state };
+        if (opts.json) say(JSON.stringify(payload));
+        else check("已选用 OpenAI Secure Tunnel");
+        return;
+      }
       if (mode !== "named") {
-        throw new Error("mode must be quick or named");
+        throw new Error("mode must be quick, named, or openai");
       }
       const zone = parseZoneInput(opts.zone ?? "");
       if (!zone) {
@@ -1290,7 +1405,9 @@ tunnelCmd
         zone,
         hostname: opts.hostname,
       });
-      if (await findLiveBridge(workspace.id)) await stopBridge(root);
+      if ((await findInstallationObservation(undefined, runtimeCompatibility())).state === "healthy") {
+        await stopBridge();
+      }
       const payload = {
         ...tunnelChoicePayload(workspace),
         ok: true,

@@ -143,6 +143,23 @@ address — same features, just a slower repair.
 
 Credentials stay in the OS app state directory, not in the project.
 
+### Optional OpenAI Secure Tunnel
+
+If an existing OpenAI Tunnel is provisioned, use the official `tunnel-client`
+with a runtime key (not `OPENAI_ADMIN_KEY`):
+
+```bash
+export CONTROL_PLANE_TUNNEL_ID=tunnel_...
+export CONTROL_PLANE_API_KEY=...
+c2c tunnel choose --mode openai
+c2c start --tunnel
+```
+
+C2C discovers `tunnel-client` from `PATH` or `C2C_TUNNEL_CLIENT_PATH`, owns one
+installation-level client process, and uses the resulting
+`https://api.openai.com/v1/mcp/<tunnel_id>` connector URL. Tunnel creation and
+delete remain an external provisioning task.
+
 ### Multiple workspaces
 
 One installation has one MCP endpoint and one ChatGPT connector. Register
@@ -157,8 +174,9 @@ c2c workspace set-default main
 
 ChatGPT can call `list_workspaces`, then pass `workspace: "main"` or the
 returned `workspaceId` to `read_file`, `git_status`, and the other
-workspace-dependent tools. An omitted selector uses the persisted default;
-unknown, disabled, removed, or ambiguous selectors fail instead of falling
+workspace-dependent tools. With one enabled workspace omission is convenient;
+with several, set a default explicitly or pass `workspace` on every call.
+Unknown, disabled, removed, or colliding selectors fail instead of falling
 back. See [multi-workspace](docs/multi-workspace.md).
 
 ## How it works
@@ -176,7 +194,7 @@ back. See [multi-workspace](docs/multi-workspace.md).
              │      C2C Bridge     │   loopback-only HTTP server
              │  read-only MCP      │   OAuth 2.1 + one-time pairing code
              │  OAuth + Pairing    │   Cloudflare Quick Tunnel
-             │  Tunnel Manager     │
+             │  Tunnel Manager     │   Cloudflare or official OpenAI client
              └──────────┬──────────┘
                         │  request-scoped, read-only
                         ▼
@@ -192,7 +210,7 @@ back. See [multi-workspace](docs/multi-workspace.md).
 - **Data plane (MCP)**: ChatGPT pulls what it needs itself through the
   read-only tools. `list_workspaces` discovers the registered targets; every
   workspace-dependent tool accepts an optional workspace id/alias and otherwise
-  uses the stable default.
+  uses the stable default when configured (or the only enabled workspace).
 - **Independent review**: after Codex executes, ChatGPT inspects the actual
   git diff and test records through MCP — it never trusts "all tests passed"
   claims blindly.
@@ -221,7 +239,7 @@ Full threat model: [docs/security.md](docs/security.md)
 ```bash
 pnpm install
 pnpm build          # -> dist/, exposes the `c2c` bin
-pnpm test           # vitest: 150 tests (path security, OAuth, pairing, MCP e2e)
+pnpm test           # vitest: path security, OAuth, lifecycle, tunnel, pairing, MCP e2e
 
 c2c setup           # bridge + tunnel + pairing code, all in one
 c2c sandbox-allow   # whitelist the settings dir in Codex (macOS + Windows)
@@ -229,8 +247,10 @@ c2c status / doctor / pair / unpair / logs / stop
 c2c workspace add/list/set-default/enable/disable/remove
 ```
 
-Requirements: Node.js >= 20, git. `cloudflared` for the public connection
-(auto-detected; the Skill installs it for you). If QUIC is blocked, set
+Requirements: Node.js >= 20, git. `cloudflared` for the Cloudflare public
+connection (auto-detected; the Skill installs it for you). The OpenAI option
+uses an already installed official `tunnel-client`; set
+`C2C_TUNNEL_CLIENT_PATH` when it is not on PATH. If QUIC is blocked, set
 `C2C_TUNNEL_PROTOCOL=http2` and restart the bridge.
 
 Docs: [multi-workspace](docs/multi-workspace.md) · [architecture](docs/architecture.md) ·
@@ -245,7 +265,7 @@ src/
   auth/       OAuth 2.1 (PKCE, DCR, refresh rotation, revocation)
   pairing/    one-time pairing codes (CSPRNG, TTL, rate limits)
   workspace/  registry, path containment, sensitive-file policy, search, git
-  tunnel/     TunnelProvider abstraction + Cloudflare Quick/Named Tunnel
+  tunnel/     TunnelProvider + Cloudflare Quick/Named + OpenAI tunnel-client
   execution/  execution records for the review loop
   process/    daemon lifecycle
   cli/        the c2c CLI

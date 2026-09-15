@@ -1,6 +1,7 @@
 import os from "node:os";
 import path from "node:path";
 import fs from "node:fs";
+import { randomBytes } from "node:crypto";
 
 /**
  * State directory resolution, following OS conventions.
@@ -31,20 +32,40 @@ export function stateSubdir(name: string): string {
   return ensureDir(path.join(getStateDir(), name));
 }
 
-/** Write a JSON file with owner-only permissions. */
+/** Write a JSON file with owner-only permissions, replacing it atomically. */
 export function writeSecureJson(file: string, data: unknown): void {
-  ensureDir(path.dirname(file));
-  fs.writeFileSync(file, JSON.stringify(data, null, 2), { mode: 0o600 });
+  const dir = ensureDir(path.dirname(file));
+  const temporary = path.join(
+    dir,
+    `.${path.basename(file)}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`
+  );
   try {
-    fs.chmodSync(file, 0o600);
-  } catch {
-    // best effort on platforms without chmod semantics
+    fs.writeFileSync(temporary, JSON.stringify(data, null, 2), { mode: 0o600 });
+    try {
+      fs.chmodSync(temporary, 0o600);
+    } catch {
+      // best effort on platforms without chmod semantics
+    }
+    fs.renameSync(temporary, file);
+  } catch (error) {
+    try {
+      fs.rmSync(temporary, { force: true });
+    } catch {
+      // best effort cleanup
+    }
+    throw error;
   }
+}
+
+/** Read JSON while preserving parse/I/O errors for fail-closed state readers. */
+export function readJsonStrict<T>(file: string): T | null {
+  if (!fs.existsSync(file)) return null;
+  return JSON.parse(fs.readFileSync(file, "utf8")) as T;
 }
 
 export function readJsonIfExists<T>(file: string): T | null {
   try {
-    return JSON.parse(fs.readFileSync(file, "utf8")) as T;
+    return readJsonStrict<T>(file);
   } catch {
     return null;
   }

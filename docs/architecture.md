@@ -35,7 +35,7 @@
 - **Computer Use = control plane**: tiny `[C2C]` state messages (< 1 KB).
 - **MCP = data plane**: ChatGPT pulls files/diffs/search results itself.
 - **Read-only by design**: no write/exec tools exist in V1 at all.
-- **Workspace is the read boundary**: one installation bridge owns a registered allowlist, and every workspace-dependent MCP call resolves one target by id/alias (or the persisted default).
+- **Workspace is the read boundary**: one installation bridge owns a registered allowlist, and every workspace-dependent MCP call resolves one target by id/alias (or the persisted default). The installation has one stable identity and one owner lock; there is no mutable current workspace.
 
 ## Components (src/)
 
@@ -46,7 +46,7 @@
 | `auth/` | OAuth 2.1 authorization server: discovery metadata (RFC 8414 + Protected Resource Metadata), dynamic client registration (RFC 7591), authorization-code + PKCE (S256 only), refresh rotation, revocation (RFC 7009). Opaque tokens stored as SHA-256 hashes |
 | `pairing/` | PairingCode lifecycle: CSPRNG generation, TTL, attempt limits, IP rate limit, one-time use |
 | `workspace/` | Canonical-path containment, sensitive-file policy, `.c2cignore`, paginated read/list, search/git, and the installation workspace registry |
-| `tunnel/` | Installation-owned `TunnelProvider` interface + Cloudflare Quick/Named implementations; legacy per-workspace configuration is only a migration fallback |
+| `tunnel/` | Installation-owned `TunnelProvider` interface + Cloudflare Quick/Named and official OpenAI `tunnel-client` integration; legacy per-workspace configuration is only a migration fallback |
 | `execution/` | JSONL execution records plus optional sanitized command output (`execution_output`) |
 | `process/` | Daemon spawn/reuse, health probing, graceful shutdown |
 | `cli/` | `c2c` commands; `--json` everywhere for the Skill |
@@ -65,16 +65,20 @@ workspace is changed by a request.
 `/oauth/authorize` (HTML pairing page) → pairing code verified → 302 with
 authorization code → `/oauth/token` (PKCE S256) → access + refresh tokens.
 
-**Ports**: prefer 48765, bind 127.0.0.1 only. On conflict, `/health` identifies
-whether the occupant is a c2c bridge for the same installation/registered
-workspace (reuse) or not (fall back to an ephemeral port). Configuration follows
-automatically via installation runtime state; users never see ports. Registering
-another root updates the allowlist without starting a second tunnel.
+**Lifecycle/ports**: prefer 48765, bind 127.0.0.1 only. A state-directory
+startup lock serializes check-and-spawn, and the daemon holds an installation
+owner lock for its lifetime; a compatible `/health` + runtime/contract/build
+identity is reused, while an unknown/conflicting owner is never killed or
+silently reused.
+A non-C2C occupant may still cause the single owner to fall back to an ephemeral
+port. Configuration follows via installation runtime state; users never manage
+ports. Registering another root updates the allowlist without starting a second
+daemon or tunnel.
 
-**Tunnel**: default is a Cloudflare Quick Tunnel (`cloudflared tunnel --url …`).
-The URL changes per start, so `c2c doctor` can restart it and tell the Skill to
-Delete + recreate the installation's ChatGPT connector. The workspace target
-never changes that connector. The Skill asks before the first public URL exists;
+**Tunnel**: default is a Cloudflare Quick Tunnel (`cloudflared tunnel --url …`); an installation may instead use the official OpenAI `tunnel-client` with an existing Tunnel ID and runtime `CONTROL_PLANE_API_KEY`. The child receives no `OPENAI_ADMIN_KEY`, and the tunnel-client owner lock plus daemon owner lock prevent two clients sharing one tunnel id/channel.
+The Quick Tunnel URL changes per start, so `c2c doctor` can restart it and tell the Skill to
+Delete + recreate the installation's ChatGPT connector; an OpenAI tunnel uses its
+stable tunnel-id URL. The workspace target never changes that connector. The Skill asks before the first public URL exists;
 `cloudflared tunnel login` is the only extra user step. Tunnel name, hostname
 and preference live under the OS state dir using the installation identity
 (old `tunnels/<workspaceId>.json` state is a migration fallback), never in the
