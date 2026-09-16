@@ -18,7 +18,7 @@ import { createMcpServer } from "../mcp/server.js";
 import { createMcpHttpHandler } from "../mcp/http.js";
 import { CloudflaredQuickTunnel } from "../tunnel/cloudflared.js";
 import { CloudflaredNamedTunnel } from "../tunnel/cloudflared-named.js";
-import { OpenAiSecureTunnel, type TunnelAuthorization } from "../tunnel/openai-secure.js";
+import { OpenAiSecureTunnel } from "../tunnel/openai-secure.js";
 import type { TunnelProvider } from "../tunnel/provider.js";
 import {
   namedTunnelBinding,
@@ -38,9 +38,7 @@ import {
 function tunnelForInstallation(
   _defaultWorkspaceId: string,
   logger: Logger,
-  mcpAuthorization?: () => TunnelAuthorization | Promise<TunnelAuthorization>,
-  onAuthorizationInvalidated?: () => void | Promise<void>,
-  onAuthorizationReplaced?: () => void | Promise<void>,
+  mcpAuthorization?: string,
   usePersistedState = true
 ): TunnelProvider {
   // Non-persisted embedded bridges are isolated test/consumer instances; they
@@ -54,8 +52,6 @@ function tunnelForInstallation(
       logger,
       tunnelId: state.tunnelId || process.env.CONTROL_PLANE_TUNNEL_ID?.trim(),
       mcpAuthorization,
-      onAuthorizationInvalidated,
-      onAuthorizationReplaced,
     });
   }
   const binding = namedTunnelBinding(state);
@@ -91,6 +87,7 @@ export interface BridgeOptions {
   exitOnShutdown?: boolean;
   authStoreFile?: string;
   pairingTtlMs?: number;
+  /** @deprecated Tunnel authorization is bridge-lifetime and no longer uses an access-token TTL. */
   accessTokenTtlMs?: number;
 }
 
@@ -169,49 +166,14 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
       opts.authStoreFile ??
       path.join(getStateDir(), "auth", `${legacySingle ? workspace.id : "installation"}.json`),
   });
-  const tunnelTokenTtlMs = Math.max(1_000, opts.accessTokenTtlMs ?? 5 * 60 * 1_000);
-  let tunnelAuthorization: { raw: string; value: string; expiresAt: number } | null = null;
-  const retiredTunnelAuthorizations: string[] = [];
-  const getTunnelAuthorization = (): TunnelAuthorization => {
-    const refreshAt = Date.now() + 30_000;
-    if (tunnelAuthorization && tunnelAuthorization.expiresAt > refreshAt) {
-      return { value: tunnelAuthorization.value, expiresAt: tunnelAuthorization.expiresAt };
-    }
-    if (tunnelAuthorization) retiredTunnelAuthorizations.push(tunnelAuthorization.raw);
-    const issued = authStore.issueTokens({
-      clientId: "c2c-openai-tunnel",
-      scopes: [...SUPPORTED_SCOPES].filter((scope) => scope !== "offline_access"),
-      accessTtlMs: tunnelTokenTtlMs,
-    });
-    tunnelAuthorization = {
-      raw: issued.accessToken,
-      value: `Bearer ${issued.accessToken}`,
-      expiresAt: Date.now() + tunnelTokenTtlMs,
-    };
-    return { value: tunnelAuthorization.value, expiresAt: tunnelAuthorization.expiresAt };
-  };
-  const retireTunnelAuthorizations = (): void => {
-    for (const raw of retiredTunnelAuthorizations) authStore.revokeToken(raw);
-    retiredTunnelAuthorizations.length = 0;
-  };
-  const clearTunnelAuthorization = (): void => {
-    if (tunnelAuthorization) authStore.revokeToken(tunnelAuthorization.raw);
-    for (const raw of retiredTunnelAuthorizations) authStore.revokeToken(raw);
-    retiredTunnelAuthorizations.length = 0;
-    tunnelAuthorization = null;
-  };
+  const internalTunnelToken = `c2c_tunnel_${randomBytes(32).toString("base64url")}`;
   const pairing = new PairingManager(INSTALLATION_WORKSPACE_ID, { ttlMs: opts.pairingTtlMs });
   // One provider belongs to the bridge/installation, never to a tool call.
   const tunnel =
     opts.tunnelProvider ??
-    tunnelForInstallation(
-      workspace.id,
-      logger,
-      getTunnelAuthorization,
-      clearTunnelAuthorization,
-      retireTunnelAuthorizations,
-      ownsInstallation
-    );
+    tunnelForInstallation(workspace.id, logger, `Bearer ${internalTunnelToken}`, ownsInstallation);
+  const internalMcpToken =
+    opts.tunnelProvider === undefined && tunnel.name === "openai-secure" ? internalTunnelToken : undefined;
   const adminToken = `c2c_admin_${randomBytes(24).toString("base64url")}`;
 
   let publicBaseUrl: string | null = null;
@@ -284,8 +246,10 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
     express.json({ limit: "8mb" }),
     bearerAuth({
       store: authStore,
-      // Multi-workspace tokens authorize the installation, not one target.
+      // Multi-workspace OAuth tokens authorize the installation, not one target.
       workspaceId: legacySingle ? workspace.id : undefined,
+      internalToken: internalMcpToken,
+      internalScopes: [...SUPPORTED_SCOPES].filter((scope) => scope !== "offline_access"),
       getBaseUrl,
       logger,
     }),
@@ -354,15 +318,13 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
     void withTunnelOperation(async () => {
       if (closed) throw new Error("Bridge is shutting down.");
       const status = tunnel.status();
-      const usable = status.running && status.authorizationHealthy !== false;
-      const url = usable ? (status.url ?? tunnel.getPublicUrl()) : await tunnel.start(port);
+      const url = status.running ? (status.url ?? tunnel.getPublicUrl()) : await tunnel.start(port);
       publicBaseUrl = url;
       persistRuntime();
       return url;
     })
       .then((url) => res.json({ url }))
       .catch((error: Error) => {
-        clearTunnelAuthorization();
         logger.error(`Tunnel start failed: ${error.message}`);
         res.status(500).json({ error: "tunnel_failed", message: error.message });
       });
@@ -370,10 +332,7 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
 
   app.post("/admin/tunnel/stop", adminGuard, (_req, res) => {
     void withTunnelOperation(async () => {
-      // Stop even when a provider child is still starting and therefore is not
-      // yet reported as ready; otherwise its credential remains live.
       await tunnel.stop();
-      clearTunnelAuthorization();
       publicBaseUrl = null;
       persistRuntime();
     })
@@ -384,23 +343,8 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
   app.post("/admin/revoke-all", adminGuard, (_req, res) => {
     const count = authStore.revokeAll();
     pairing.invalidateAll();
-    clearTunnelAuthorization();
-    const tunnelStatus = tunnel.status();
-    const tunnelHasChild = tunnelStatus.running || Boolean(tunnelStatus.detail?.includes("running"));
-    const operation =
-      tunnel.name === "openai-secure" && tunnelHasChild
-        ? withTunnelOperation(async () => {
-            const url = await tunnel.restart(port);
-            publicBaseUrl = url;
-            persistRuntime();
-          })
-        : Promise.resolve();
-    void operation
-      .then(() => {
-        logger.info(`Revoked all tokens (${count})`);
-        res.json({ revoked: count });
-      })
-      .catch((error: Error) => res.status(500).json({ error: "tunnel_failed", message: error.message }));
+    logger.info(`Revoked all tokens (${count})`);
+    res.json({ revoked: count });
   });
 
   app.post("/admin/shutdown", adminGuard, (_req, res) => {
@@ -417,15 +361,6 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
   let ownerLock: StateLock | null = null;
   if (ownsInstallation) {
     ownerLock = await acquireStateLockAsync(path.join(getStateDir(), "runtime", "installation-owner.lock"), { timeoutMs: 250 });
-    // Only the verified installation owner may revoke a previous internal
-    // tunnel authorization; a direct second serve must fail at the lock first.
-    try {
-      authStore.revokeClientTokens("c2c-openai-tunnel");
-    } catch (error) {
-      ownerLock.release();
-      ownerLock = null;
-      throw error;
-    }
   }
 
   let server: Server;
@@ -486,7 +421,6 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
       closed = false;
       throw error;
     }
-    clearTunnelAuthorization();
     await new Promise<void>((resolve) => server.close(() => resolve()));
     if (ownsInstallation) clearInstallationRuntime();
     else clearRuntimeState(workspace.id);
