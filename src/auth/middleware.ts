@@ -1,7 +1,6 @@
-import { timingSafeEqual } from "node:crypto";
 import type { NextFunction, Request, Response } from "express";
 import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
-import type { AuthStore } from "./store.js";
+import { safeEqual, type AuthStore } from "./store.js";
 import type { Logger } from "../logger/index.js";
 
 export interface InternalBearer {
@@ -18,12 +17,6 @@ export interface BearerAuthDeps {
   internalBearer?: InternalBearer;
   getBaseUrl: (req: Request) => string;
   logger: Logger;
-}
-
-function secureTokenEqual(actual: string, expected: string): boolean {
-  const actualBytes = Buffer.from(actual);
-  const expectedBytes = Buffer.from(expected);
-  return actualBytes.length === expectedBytes.length && timingSafeEqual(actualBytes, expectedBytes);
 }
 
 /**
@@ -48,7 +41,7 @@ export function bearerAuth(deps: BearerAuthDeps) {
       return;
     }
     const token = header.slice(7).trim();
-    if (deps.internalBearer && secureTokenEqual(token, deps.internalBearer.token)) {
+    if (deps.internalBearer && safeEqual(token, deps.internalBearer.token)) {
       const authInfo: AuthInfo = {
         token,
         clientId: deps.internalBearer.clientId,
