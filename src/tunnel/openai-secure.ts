@@ -28,11 +28,6 @@ interface SavedTunnelProcess {
   tunnelId: string;
 }
 
-export interface TunnelAuthorization {
-  value: string;
-  expiresAt: number;
-}
-
 export interface OpenAiSecureTunnelOptions {
   logger?: Logger;
   tunnelId?: string;
@@ -45,12 +40,8 @@ export interface OpenAiSecureTunnelOptions {
   spawnProcess?: SpawnProcess;
   readyProbe?: ReadyProbe;
   controlPlaneBaseUrl?: string;
-  /** Optional short-lived bearer used for the local MCP binding. */
-  mcpAuthorization?: () => TunnelAuthorization | Promise<TunnelAuthorization>;
-  /** Revoke the bearer when an unexpected child exit invalidates its channel. */
-  onAuthorizationInvalidated?: () => void | Promise<void>;
-  /** Retire the previous bearer only after its replacement child is ready. */
-  onAuthorizationReplaced?: () => void | Promise<void>;
+  /** Stable Bridge-lifetime Authorization header for the loopback MCP binding. */
+  mcpAuthorization?: string;
 }
 
 function defaultReadyProbe(baseUrl: string): Promise<boolean> {
@@ -71,10 +62,10 @@ function normalizeBaseUrl(value: string): string {
 /**
  * Integration layer for the official OpenAI tunnel-client binary.
  *
- * The API key is passed to the child through CONTROL_PLANE_API_KEY and only
- * referenced by the official `env:` flag; it is never put in C2C state or
- * command-line arguments. The provider has one installation lock and one
- * child at a time, independent of workspace routing.
+ * The control-plane API key and the local MCP Authorization value are passed
+ * to the child through environment references. Neither secret is placed in
+ * C2C state or command-line arguments. The provider owns one installation
+ * lock and one child at a time, independent of workspace routing.
  */
 export class OpenAiSecureTunnel implements TunnelProvider {
   readonly name = "openai-secure";
@@ -93,15 +84,11 @@ export class OpenAiSecureTunnel implements TunnelProvider {
   private lifecycle: Promise<unknown> = Promise.resolve();
   private recoveryTimer: ReturnType<typeof setTimeout> | null = null;
   private recoveryAttempts = 0;
-  private authorizationTimer: ReturnType<typeof setTimeout> | null = null;
   private stopping = false;
   private stopRequested = false;
   private lastError: string | null = null;
   private activeTunnelId: string | null = null;
   private activeApiKeyDigest: string | null = null;
-  private activeAuthorizationDigest: string | null = null;
-  private activeAuthorizationExpiresAt: number | null = null;
-  private authorizationError: string | null = null;
 
   constructor(options: OpenAiSecureTunnelOptions = {}) {
     this.options = options;
@@ -124,6 +111,13 @@ export class OpenAiSecureTunnel implements TunnelProvider {
       throw new Error("NEED_OPENAI_TUNNEL_KEY: set CONTROL_PLANE_API_KEY for tunnel-client runtime use.");
     }
     return { tunnelId, apiKey };
+  }
+
+  private authorization(): string | null {
+    if (this.options.mcpAuthorization === undefined) return null;
+    const value = this.options.mcpAuthorization.trim();
+    if (!value) throw new Error("OpenAI tunnel MCP authorization is empty.");
+    return value;
   }
 
   private binary(): string | null {
@@ -171,83 +165,6 @@ export class OpenAiSecureTunnel implements TunnelProvider {
       healthUrlFile,
     );
     return args;
-  }
-
-  private async authorization(): Promise<TunnelAuthorization | null> {
-    if (!this.options.mcpAuthorization) return null;
-    const authorization = await this.options.mcpAuthorization();
-    if (!authorization.value || !Number.isFinite(authorization.expiresAt) || authorization.expiresAt <= Date.now()) {
-      throw new Error("OpenAI tunnel MCP authorization is missing or expired.");
-    }
-    return authorization;
-  }
-
-  private isAuthorizationHealthy(): boolean {
-    if (!this.options.mcpAuthorization) return true;
-    return Boolean(
-      this.activeAuthorizationDigest &&
-        this.activeAuthorizationExpiresAt &&
-        this.activeAuthorizationExpiresAt > Date.now() &&
-        !this.authorizationError
-    );
-  }
-
-  private scheduleAuthorizationRefresh(expiresAt: number): void {
-    if (this.authorizationTimer) clearTimeout(this.authorizationTimer);
-    // Schedule inside the provider's 30s refresh window, with a 1s margin so
-    // timer jitter cannot leave start() returning the still-current bearer.
-    const delay = Math.max(10, expiresAt - Date.now() - 29_000);
-    this.authorizationTimer = setTimeout(() => {
-      this.authorizationTimer = null;
-      void this.refreshAuthorization(expiresAt);
-    }, delay);
-  }
-
-  private scheduleAuthorizationRetry(expiresAt: number): void {
-    if (this.authorizationTimer) clearTimeout(this.authorizationTimer);
-    const remaining = expiresAt - Date.now();
-    if (remaining <= 0) {
-      void this.expireAuthorization();
-      return;
-    }
-    this.authorizationTimer = setTimeout(() => {
-      this.authorizationTimer = null;
-      void this.refreshAuthorization(expiresAt);
-    }, Math.min(1_000, Math.max(100, remaining - 1_000)));
-  }
-
-  private async refreshAuthorization(expiresAt: number): Promise<void> {
-    if (this.stopping || this.localPort === null) return;
-    const port = this.localPort;
-    try {
-      await this.start(port);
-      return;
-    } catch (error) {
-      const message = (error as Error).message;
-      this.authorizationError = message;
-      this.lastError = message;
-      this.logger.warn(`OpenAI tunnel authorization refresh failed: ${message}`);
-      if (this.localPort === null && !this.child) this.localPort = port;
-      if (!this.stopping && this.localPort !== null && Date.now() < expiresAt) {
-        this.scheduleAuthorizationRetry(expiresAt);
-      } else if (!this.stopping) {
-        void this.expireAuthorization();
-      }
-    }
-  }
-
-  private async expireAuthorization(): Promise<void> {
-    if (this.stopping || !this.child) return;
-    const message = "OpenAI tunnel MCP authorization expired before its replacement became ready.";
-    this.authorizationError = message;
-    this.lastError = message;
-    try {
-      await this.stop();
-      await this.options.onAuthorizationInvalidated?.();
-    } catch (error) {
-      this.lastError = `${message} ${(error as Error).message}`;
-      this.logger.error(`OpenAI tunnel authorization shutdown failed: ${this.lastError}`);
-    }
   }
 
   private async readReadyUrl(file: string): Promise<string | null> {
@@ -364,17 +281,8 @@ export class OpenAiSecureTunnel implements TunnelProvider {
         this.healthUrl = null;
         this.activeTunnelId = null;
         this.activeApiKeyDigest = null;
-        this.activeAuthorizationDigest = null;
-        this.activeAuthorizationExpiresAt = null;
-        if (this.authorizationTimer) clearTimeout(this.authorizationTimer);
-        this.authorizationTimer = null;
         this.clearProcessState(child.pid);
-        if (!this.stopping) {
-          void Promise.resolve(this.options.onAuthorizationInvalidated?.()).catch((error: Error) => {
-            this.logger.warn(`OpenAI tunnel authorization cleanup failed: ${error.message}`);
-          });
-          if (this.localPort !== null) this.scheduleRecovery(null, null);
-        }
+        if (!this.stopping && this.localPort !== null) this.scheduleRecovery(null, null);
       }
     });
     child.once("exit", (code, signal) => {
@@ -383,17 +291,8 @@ export class OpenAiSecureTunnel implements TunnelProvider {
       this.healthUrl = null;
       this.activeTunnelId = null;
       this.activeApiKeyDigest = null;
-      this.activeAuthorizationDigest = null;
-      this.activeAuthorizationExpiresAt = null;
-      if (this.authorizationTimer) clearTimeout(this.authorizationTimer);
-      this.authorizationTimer = null;
       this.clearProcessState(child.pid);
-      if (!this.stopping) {
-        void Promise.resolve(this.options.onAuthorizationInvalidated?.()).catch((error: Error) => {
-          this.logger.warn(`OpenAI tunnel authorization cleanup failed: ${error.message}`);
-        });
-        if (this.localPort !== null) this.scheduleRecovery(code, signal);
-      }
+      if (!this.stopping && this.localPort !== null) this.scheduleRecovery(code, signal);
     });
   }
 
@@ -420,11 +319,11 @@ export class OpenAiSecureTunnel implements TunnelProvider {
     }, Math.min(1_000 * attempt, 5_000));
   }
 
-  private async startInternal(localPort: number, suppliedAuthorization?: TunnelAuthorization | null): Promise<string | null> {
+  private async startInternal(localPort: number): Promise<string | null> {
     if (this.child && this.activeTunnelId) return this.connectorUrl(this.activeTunnelId);
     if (this.stopping) throw new Error("OpenAI tunnel is stopping.");
     const { tunnelId, apiKey } = this.credentials();
-    const authorization = suppliedAuthorization === undefined ? await this.authorization() : suppliedAuthorization;
+    const authorization = this.authorization();
     const binary = this.binary();
     if (!binary) throw new Error("NEED_OPENAI_TUNNEL_CLIENT: official tunnel-client was not found on PATH.");
     if (!this.ownerLock) this.ownerLock = await acquireStateLockAsync(this.lockPath, { timeoutMs: 250 });
@@ -445,7 +344,7 @@ export class OpenAiSecureTunnel implements TunnelProvider {
       childEnv.CONTROL_PLANE_TUNNEL_ID = tunnelId;
       childEnv.CONTROL_PLANE_API_KEY = apiKey;
       delete childEnv.C2C_MCP_AUTHORIZATION;
-      if (authorization) childEnv.C2C_MCP_AUTHORIZATION = authorization.value;
+      if (authorization) childEnv.C2C_MCP_AUTHORIZATION = authorization;
       if (this.options.controlPlaneBaseUrl) childEnv.CONTROL_PLANE_BASE_URL = this.options.controlPlaneBaseUrl;
       const child = (this.options.spawnProcess ?? spawn)(binary, this.args(localPort, healthUrlFile, tunnelId, authorization !== null), {
         env: childEnv,
@@ -458,10 +357,6 @@ export class OpenAiSecureTunnel implements TunnelProvider {
       if (this.child !== child || this.stopping) throw new Error("tunnel-client exited during startup");
       this.activeTunnelId = tunnelId;
       this.activeApiKeyDigest = this.apiKeyDigest(apiKey);
-      this.activeAuthorizationDigest = authorization ? this.apiKeyDigest(authorization.value) : null;
-      this.activeAuthorizationExpiresAt = authorization?.expiresAt ?? null;
-      this.authorizationError = null;
-      if (authorization) this.scheduleAuthorizationRefresh(authorization.expiresAt);
       this.recoveryAttempts = 0;
       return this.connectorUrl(tunnelId);
     } catch (error) {
@@ -480,10 +375,6 @@ export class OpenAiSecureTunnel implements TunnelProvider {
       this.healthUrl = null;
       this.activeTunnelId = null;
       this.activeApiKeyDigest = null;
-      this.activeAuthorizationDigest = null;
-      this.activeAuthorizationExpiresAt = null;
-      if (this.authorizationTimer) clearTimeout(this.authorizationTimer);
-      this.authorizationTimer = null;
       // Preserve an unverifiable orphan record. Clearing it would let a later
       // start overlap a PID we explicitly refused to terminate.
       if (processStateHandled) this.clearProcessState();
@@ -494,7 +385,7 @@ export class OpenAiSecureTunnel implements TunnelProvider {
       try {
         fs.rmSync(healthUrlFile, { force: true });
       } catch {
-        // best effort cleanup of private temporary authorization/health state
+        // best effort cleanup of private temporary health state
       }
     }
   }
@@ -510,83 +401,29 @@ export class OpenAiSecureTunnel implements TunnelProvider {
       let credentials: { tunnelId: string; apiKey: string };
       try {
         credentials = this.credentials();
+        this.authorization();
       } catch (error) {
-        // An already-running child owns the last valid credential. Do not
-        // tear it down merely because the launching shell no longer exports it.
-        if (this.child && this.activeTunnelId) {
-          if (this.activeAuthorizationExpiresAt) this.scheduleAuthorizationRefresh(this.activeAuthorizationExpiresAt);
-          return this.connectorUrl(this.activeTunnelId);
-        }
+        // An already-running child owns the last valid launch configuration.
+        // Do not tear it down merely because the launching shell changes.
+        if (this.child && this.activeTunnelId) return this.connectorUrl(this.activeTunnelId);
         throw error;
       }
-      let authorization: TunnelAuthorization | null;
-      try {
-        authorization = await this.authorization();
-      } catch (error) {
-        if (this.child && this.activeTunnelId) {
-          const message = (error as Error).message;
-          this.authorizationError = message;
-          this.lastError = message;
-          if (this.activeAuthorizationExpiresAt && this.activeAuthorizationExpiresAt > Date.now()) {
-            this.scheduleAuthorizationRetry(this.activeAuthorizationExpiresAt);
-          } else {
-            void this.expireAuthorization();
-          }
-          return this.connectorUrl(this.activeTunnelId);
-        }
-        throw error;
-      }
-      const authorizationDigest = authorization ? this.apiKeyDigest(authorization.value) : null;
       if (
         this.child &&
         this.activeTunnelId === credentials.tunnelId &&
-        this.activeApiKeyDigest === this.apiKeyDigest(credentials.apiKey) &&
-        this.activeAuthorizationDigest === authorizationDigest
+        this.activeApiKeyDigest === this.apiKeyDigest(credentials.apiKey)
       ) {
-        if (authorization) {
-          this.authorizationError = null;
-          this.scheduleAuthorizationRefresh(this.activeAuthorizationExpiresAt ?? authorization.expiresAt);
-        }
         return this.connectorUrl(this.activeTunnelId);
       }
-      const hadChild = this.child !== null;
-      const replacingAuthorization =
-        hadChild &&
-        this.activeAuthorizationDigest !== null &&
-        authorizationDigest !== null &&
-        this.activeAuthorizationDigest !== authorizationDigest;
-      let oldStopped = false;
-      let authorizationInvalidated = false;
       try {
-        if (hadChild) {
+        if (this.child) {
           // Keep the installation tunnel lock across replacement so another
           // daemon cannot enter the stop/start gap and create an overlap.
           await this.stopCurrent(false);
-          oldStopped = true;
         }
         this.stopping = false;
-        const url = await this.startInternal(localPort, authorization);
-        if (replacingAuthorization) {
-          try {
-            await this.options.onAuthorizationReplaced?.();
-          } catch (error) {
-            this.authorizationError = `OpenAI tunnel authorization replacement commit failed: ${(error as Error).message}`;
-            this.lastError = this.authorizationError;
-            await this.stopCurrent();
-            await this.options.onAuthorizationInvalidated?.();
-            authorizationInvalidated = true;
-            throw error;
-          }
-        }
-        return url;
+        return await this.startInternal(localPort);
       } catch (error) {
-        if (!this.child && authorization && !authorizationInvalidated && (oldStopped || !hadChild)) {
-          try {
-            await this.options.onAuthorizationInvalidated?.();
-          } catch (invalidateError) {
-            this.logger.warn(`OpenAI tunnel authorization cleanup failed: ${(invalidateError as Error).message}`);
-          }
-        }
         this.releaseIdleOwner();
         throw error;
       }
@@ -661,10 +498,6 @@ export class OpenAiSecureTunnel implements TunnelProvider {
       this.localPort = null;
       this.activeTunnelId = null;
       this.activeApiKeyDigest = null;
-      this.activeAuthorizationDigest = null;
-      this.activeAuthorizationExpiresAt = null;
-      if (this.authorizationTimer) clearTimeout(this.authorizationTimer);
-      this.authorizationTimer = null;
       if (releaseOwner) {
         this.ownerLock?.release();
         this.ownerLock = null;
@@ -698,42 +531,11 @@ export class OpenAiSecureTunnel implements TunnelProvider {
 
   async restart(localPort: number): Promise<string | null> {
     return this.enqueue(async () => {
-      const previousAuthorization = this.activeAuthorizationDigest;
-      const authorization = await this.authorization();
-      const replacingAuthorization =
-        previousAuthorization !== null &&
-        authorization !== null &&
-        previousAuthorization !== this.apiKeyDigest(authorization.value);
       try {
         await this.stopCurrent(false);
         if (this.stopRequested) throw new Error("OpenAI tunnel restart was canceled by stop.");
+        return await this.startInternal(localPort);
       } catch (error) {
-        this.releaseIdleOwner();
-        throw error;
-      }
-      try {
-        const url = await this.startInternal(localPort, authorization);
-        if (replacingAuthorization) await this.options.onAuthorizationReplaced?.();
-        return url;
-      } catch (error) {
-        if (replacingAuthorization) {
-          this.authorizationError = `OpenAI tunnel authorization replacement failed: ${(error as Error).message}`;
-          this.lastError = this.authorizationError;
-        }
-        if (replacingAuthorization && this.child) {
-          try {
-            await this.stopCurrent();
-          } catch (stopError) {
-            this.logger.warn(`OpenAI tunnel authorization cleanup failed: ${(stopError as Error).message}`);
-          }
-        }
-        if (!this.child && authorization) {
-          try {
-            await this.options.onAuthorizationInvalidated?.();
-          } catch (invalidateError) {
-            this.logger.warn(`OpenAI tunnel authorization cleanup failed: ${(invalidateError as Error).message}`);
-          }
-        }
         this.releaseIdleOwner();
         throw error;
       }
@@ -741,22 +543,17 @@ export class OpenAiSecureTunnel implements TunnelProvider {
   }
 
   status(): TunnelStatus {
-    const authorizationHealthy = this.isAuthorizationHealthy();
     return {
       running: this.child !== null && this.healthUrl !== null,
       url: this.activeTunnelId ? this.connectorUrl(this.activeTunnelId) : null,
       provider: this.name,
-      detail: this.authorizationError
-        ? `OPENAI_MCP_AUTHORIZATION_UNHEALTHY: ${this.authorizationError}`
-        : this.healthUrl
-          ? `health=${this.healthUrl}`
-          : !this.child && fs.existsSync(this.processStateFile)
-            ? "OPENAI_TUNNEL_CONFLICT: previous tunnel-client state remains"
-            : this.child
-              ? "tunnel-client running but not ready"
-              : this.lastError ?? undefined,
-      authorizationHealthy,
-      authorizationExpiresAt: this.activeAuthorizationExpiresAt ?? undefined,
+      detail: this.healthUrl
+        ? `health=${this.healthUrl}`
+        : !this.child && fs.existsSync(this.processStateFile)
+          ? "OPENAI_TUNNEL_CONFLICT: previous tunnel-client state remains"
+          : this.child
+            ? "tunnel-client running but not ready"
+            : this.lastError ?? undefined,
     };
   }
 
@@ -770,6 +567,7 @@ export class OpenAiSecureTunnel implements TunnelProvider {
     let credentials: { tunnelId: string; apiKey: string } | null = null;
     try {
       credentials = this.credentials();
+      this.authorization();
     } catch (error) {
       problems.push((error as Error).message.split(":")[0]);
     }
@@ -787,9 +585,6 @@ export class OpenAiSecureTunnel implements TunnelProvider {
     if (!this.child && owner.state === "unknown") problems.push(`OPENAI_TUNNEL_CONFLICT: ${owner.reason}`);
     if (credentials && this.child === null && owner.state === "free") problems.push("tunnel-client process not running");
     if (this.child && !this.healthUrl) problems.push("tunnel-client running but not ready");
-    if (this.child && !this.isAuthorizationHealthy()) {
-      problems.push(`OPENAI_MCP_AUTHORIZATION_UNHEALTHY: ${this.authorizationError ?? "current bearer is not usable"}`);
-    }
     if (!this.child && fs.existsSync(this.processStateFile)) {
       problems.push("OPENAI_TUNNEL_CONFLICT: previous tunnel-client state remains");
     }

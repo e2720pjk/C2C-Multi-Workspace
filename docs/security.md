@@ -4,32 +4,34 @@
 
 1. **Registered workspace root** is the smallest read authorization boundary.
    One installation bridge serves an explicit registry; every workspace-dependent
-   request resolves one enabled id/alias (or the persisted default). OAuth
-   authorizes the installation endpoint, while the registry prevents a request
-   for A from reading B or an unregistered root.
+   request resolves one enabled id/alias (or the persisted default). Endpoint
+   authentication authorizes the installation, while the registry prevents a
+   request for A from reading B or an unregistered root.
 2. **Workspace content is untrusted.** README, comments, diffs may contain
    prompt injection. Every MCP tool description carries an explicit warning and
    tools never grant capabilities based on file content.
-3. **The model never sees long-lived credentials.** Computer Use only ever
-   handles the one-time pairing code. Access/refresh tokens travel only inside
-   the OAuth redirect/token endpoints between ChatGPT's client and the bridge.
+3. **The model never sees local long-lived credentials.** OAuth access/refresh
+   tokens travel only inside the OAuth redirect/token endpoints. For OpenAI
+   Secure Tunnel, the installation-owned tunnel-client injects a separate local
+   bearer on the loopback MCP hop; ChatGPT never receives that bearer.
 
 ## Threat model → mitigations
 
 | Threat | Mitigation |
 | --- | --- |
-| MCP URL leaks | URL alone is useless: every `/mcp` request requires a valid bearer token (401 without); tokens authorize the installation endpoint and cannot add roots to the registry |
+| MCP URL leaks | URL alone is useless: every `/mcp` request requires a valid bearer token (401 without); authentication authorizes the installation endpoint and cannot add roots to the registry |
 | Pairing code brute force | 8 chars from a 31-char CSPRNG alphabet (~40 bits), 5 attempts per session, per-IP rate limit (10/min), 5-minute TTL, one-time use, session destroyed on limit |
 | OAuth CSRF | `state` round-tripped verbatim; authorization requests are server-side records keyed by random ids |
 | Code interception | PKCE S256 mandatory (plain rejected); authorization codes are one-time, 5-minute TTL, bound to client + redirect URI |
-| Token theft | Opaque high-entropy tokens; stored only as SHA-256 hashes; access tokens live 1 h; refresh tokens rotate on every use (replay of the old one fails); revocation endpoint + `c2c unpair` |
+| OAuth token theft | Opaque high-entropy tokens; stored only as SHA-256 hashes; access tokens live 1 h; refresh tokens rotate on every use (replay of the old one fails); revocation endpoint + `c2c unpair` |
+| OpenAI local bearer theft | A separate high-entropy bearer is generated in memory for the Bridge process lifetime, passed to tunnel-client through an environment-backed header reference, never persisted or placed in argv, and replaced naturally when the Bridge process restarts |
 | Workspace traversal | `realpath` canonicalization of the deepest existing ancestor; containment check against the canonical root; case-insensitive comparison on macOS/Windows; rejects `..`, absolute escapes, backslash tricks, null bytes |
 | Symlink escape | Canonicalization resolves symlinks before the containment check (file and directory symlinks both covered by tests) |
 | Sensitive files | Deny-by-default patterns (.env*, keys, SSH, cloud creds, keychains…) enforced at resolve time — reads, listings, and search all pass through the same gate; `git diff` adds pathspec excludes; `.env.example` allowed |
 | Oversized file / diff DoS | read_file caps lines and bytes per response; git_diff paginates by byte offset with hard caps; search caps matches and file sizes |
-| Tunnel exposure | Bridge binds 127.0.0.1 only (refuses 0.0.0.0); the only public surface is HTTPS via the one installation tunnel, protected by OAuth; `/health` reveals ids/health only |
+| Tunnel exposure | Bridge binds 127.0.0.1 only (refuses 0.0.0.0); the only public surface is HTTPS via the one installation tunnel; `/mcp` still requires a bearer on the loopback hop and `/health` reveals ids/health only |
 | Admin API abuse | Loopback-only + random admin token (0600 runtime file) + requests with proxy headers (`cf-connecting-ip`, `x-forwarded-for`) rejected; unauthenticated probes get 404 |
-| Log credential leakage | Logger redacts token prefixes, bearer headers, token-like parameters, and pairing-code-shaped strings before writing; the OpenAI runtime key is passed only through the tunnel-client environment and never persisted or put in argv |
+| Log credential leakage | Logger redacts token prefixes, bearer headers, token-like parameters, and pairing-code-shaped strings before writing; OpenAI runtime and local MCP credentials are referenced through the tunnel-client environment and never persisted or put in argv |
 | OpenAI tunnel ownership | Installation owner lock and tunnel-client owner lock permit one verified process per installation; health/contract/build identity mismatches fail closed |
 | OpenAI tunnel administration | C2C accepts an existing Tunnel ID plus runtime `CONTROL_PLANE_API_KEY`; it never accepts or requires `OPENAI_ADMIN_KEY`, tunnel CRUD, or organization administration |
 | Execution output leak | Codex may nominate test/build/lint logs; a local sanitizer redacts tokens, pairing-code-shaped strings and home paths, truncates size, and refuses private-key blocks entirely. Restricted items are listed without a body. ChatGPT still cannot run commands. |
@@ -37,13 +39,24 @@
 
 ## Token & scope design
 
-Scopes: `workspace.read`, `workspace.search`, `git.read`, `execution.read`,
-`offline_access`. Tools enforce scopes individually (`INSUFFICIENT_SCOPE`).
-Access tokens: 1 hour. Refresh tokens: 30 days, rotated. Multi-workspace
-installation tokens are bound to the installation and `client_id`; the selected
-workspace is still required to be in the registered, enabled allowlist. The
-installation OAuth store is canonical; no legacy tunnel or workspace-state
-migration is attempted.
+OAuth scopes are `workspace.read`, `workspace.search`, `git.read`,
+`execution.read`, and `offline_access`. Tools enforce scopes individually
+(`INSUFFICIENT_SCOPE`). OAuth access tokens live for 1 hour and refresh tokens
+for 30 days with rotation. Multi-workspace OAuth tokens are bound to the
+installation and `client_id`; the selected workspace is still required to be in
+the registered, enabled allowlist.
+
+The OpenAI Secure Tunnel loopback hop is a separate trust boundary. The Bridge
+generates one high-entropy internal bearer for its process lifetime and grants
+it the read-only MCP scopes without `offline_access`. It is not inserted into
+the OAuth store, has no periodic expiry timer, and therefore does not force a
+healthy tunnel-client process to restart merely to rotate local authorization.
+Tunnel-client crash recovery reuses the same Bridge-lifetime bearer. Restarting
+the Bridge creates a new bearer. OAuth `revoke-all` revokes OAuth sessions and
+pairing state only; it does not invalidate this installation-owned local hop.
+
+The installation OAuth store remains canonical; no legacy tunnel or workspace-
+state migration is attempted.
 
 ## Storage
 
@@ -52,11 +65,12 @@ State lives under the OS-convention app dir
 files 0600. The registered workspace collection/default, installation OAuth,
 runtime, endpoint, and tunnel metadata live there — never in a project. Only
 canonical installation state is read by the lifecycle; obsolete state fails
-closed or is ignored when it is outside the active source of truth. Only SHA-256 hashes of
-tokens are persisted — a stolen state file does not yield usable bearer tokens.
+closed or is ignored when it is outside the active source of truth. Only SHA-256
+hashes of OAuth tokens are persisted — a stolen state file does not yield usable
+bearer tokens. The OpenAI local bearer is not persisted at all.
 
 **V1 limitation**: client registrations and token hashes are file-based rather
-than OS-keychain-based. Raw tokens are never written anywhere. Keychain
+than OS-keychain-based. Raw OAuth tokens are never written anywhere. Keychain
 integration is a V2 item.
 
 ## What ChatGPT can never do (V1)
