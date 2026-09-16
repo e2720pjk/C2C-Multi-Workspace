@@ -43,7 +43,7 @@
 | --- | --- |
 | `bridge/` | Express app assembly, loopback-only listener, port fallback, runtime state, admin API |
 | `mcp/` | McpServer with workspace-aware read-only tools plus installation discovery; stateless Streamable HTTP transport (fresh server per request, JSON responses) |
-| `auth/` | OAuth 2.1 authorization server: discovery metadata (RFC 8414 + Protected Resource Metadata), dynamic client registration (RFC 7591), authorization-code + PKCE (S256 only), refresh rotation, revocation (RFC 7009). Opaque tokens stored as SHA-256 hashes |
+| `auth/` | OAuth 2.1 authorization server: discovery metadata (RFC 8414 + Protected Resource Metadata), dynamic client registration (RFC 7591), authorization-code + PKCE (S256 only), refresh rotation, revocation (RFC 7009). Opaque OAuth tokens stored as SHA-256 hashes; `/mcp` can also accept the process-local OpenAI tunnel bearer |
 | `pairing/` | PairingCode lifecycle: CSPRNG generation, TTL, attempt limits, IP rate limit, one-time use |
 | `workspace/` | Canonical-path containment, sensitive-file policy, `.c2cignore`, paginated read/list, search/git, and the installation workspace registry |
 | `tunnel/` | Installation-owned `TunnelProvider` interface + Cloudflare Quick/Named and official OpenAI `tunnel-client` integration; one canonical installation tunnel state |
@@ -60,10 +60,20 @@ middleware → stateless StreamableHTTP transport → tool handler (including
 (path containment → ignore rules → pagination) → JSON result. No mutable current
 workspace is changed by a request.
 
-**Authorization**: 401 with `WWW-Authenticate: resource_metadata=…` →
+**Authorization**: ordinary OAuth clients follow 401 with
+`WWW-Authenticate: resource_metadata=…` →
 `/.well-known/oauth-protected-resource/mcp` → AS metadata → DCR →
 `/oauth/authorize` (HTML pairing page) → pairing code verified → 302 with
 authorization code → `/oauth/token` (PKCE S256) → access + refresh tokens.
+
+OpenAI Secure Tunnel uses a different local trust boundary. The Bridge generates
+one high-entropy bearer in memory for its process lifetime. The installation-
+owned tunnel-client injects `Authorization: Bearer …` only on the loopback MCP
+hop through an environment-backed `--mcp.extra-headers` reference. This bearer
+is not an OAuth access token, is not persisted, and has no periodic rotation
+that would require replacing an otherwise healthy tunnel-client. A tunnel-client
+crash is supervised and recovered with the same Bridge-lifetime bearer; a Bridge
+restart naturally replaces the bearer.
 
 **Lifecycle/ports**: prefer 48765, bind 127.0.0.1 only. A state-directory
 startup lock serializes check-and-spawn, and the daemon holds an installation
@@ -78,7 +88,7 @@ ports. Registering another root updates the allowlist without starting a second
 daemon or tunnel. Provider changes validate the candidate first, then serialize
 stop-and-state-update in this same installation startup critical section.
 
-**Tunnel**: default is a Cloudflare Quick Tunnel (`cloudflared tunnel --url …`); an installation may instead use the official OpenAI `tunnel-client` with an existing Tunnel ID and runtime `CONTROL_PLANE_API_KEY`. The child receives no `OPENAI_ADMIN_KEY`, and the tunnel-client owner lock plus daemon owner lock prevent two clients sharing one tunnel id/channel.
+**Tunnel**: default is a Cloudflare Quick Tunnel (`cloudflared tunnel --url …`); an installation may instead use the official OpenAI `tunnel-client` with an existing Tunnel ID and runtime `CONTROL_PLANE_API_KEY`. The child receives no `OPENAI_ADMIN_KEY`, and the tunnel-client owner lock plus daemon owner lock prevent two clients sharing one tunnel id/channel. OpenAI tunnel-client ownership, verified PID identity, safe orphan reaping, and crash recovery are independent of workspace routing and remain in force even though the local bearer no longer drives periodic child replacement.
 The Quick Tunnel URL changes per start, so `c2c doctor` can restart it and tell the Skill to
 Delete + recreate the installation's ChatGPT connector; an OpenAI tunnel uses its
 stable tunnel-id URL. The workspace target never changes that connector. The Skill asks before the first public URL exists;
