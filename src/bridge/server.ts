@@ -40,7 +40,6 @@ function tunnelForInstallation(
   logger: Logger,
   mcpAuthorization?: () => TunnelAuthorization | Promise<TunnelAuthorization>,
   onAuthorizationInvalidated?: () => void | Promise<void>,
-  onAuthorizationReplaced?: () => void | Promise<void>,
   usePersistedState = true
 ): TunnelProvider {
   // Non-persisted embedded bridges are isolated test/consumer instances; they
@@ -55,7 +54,6 @@ function tunnelForInstallation(
       tunnelId: state.tunnelId || process.env.CONTROL_PLANE_TUNNEL_ID?.trim(),
       mcpAuthorization,
       onAuthorizationInvalidated,
-      onAuthorizationReplaced,
     });
   }
   const binding = namedTunnelBinding(state);
@@ -91,7 +89,6 @@ export interface BridgeOptions {
   exitOnShutdown?: boolean;
   authStoreFile?: string;
   pairingTtlMs?: number;
-  accessTokenTtlMs?: number;
 }
 
 export interface Bridge {
@@ -169,35 +166,22 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
       opts.authStoreFile ??
       path.join(getStateDir(), "auth", `${legacySingle ? workspace.id : "installation"}.json`),
   });
-  const tunnelTokenTtlMs = Math.max(1_000, opts.accessTokenTtlMs ?? 5 * 60 * 1_000);
-  let tunnelAuthorization: { raw: string; value: string; expiresAt: number } | null = null;
-  const retiredTunnelAuthorizations: string[] = [];
+  // The tunnel bearer belongs to this Bridge process, not to the OAuth token
+  // store. It is injected into the installation-owned child and revoked on
+  // stop/child failure; no timer or token replacement can interrupt the tunnel.
+  let tunnelAuthorization: { raw: string; value: string } | null = null;
   const getTunnelAuthorization = (): TunnelAuthorization => {
-    const refreshAt = Date.now() + 30_000;
-    if (tunnelAuthorization && tunnelAuthorization.expiresAt > refreshAt) {
-      return { value: tunnelAuthorization.value, expiresAt: tunnelAuthorization.expiresAt };
-    }
-    if (tunnelAuthorization) retiredTunnelAuthorizations.push(tunnelAuthorization.raw);
-    const issued = authStore.issueTokens({
+    if (tunnelAuthorization) return { value: tunnelAuthorization.value };
+    const raw = authStore.issueInternalToken({
       clientId: "c2c-openai-tunnel",
+      workspaceId: authStore.workspaceId,
       scopes: [...SUPPORTED_SCOPES].filter((scope) => scope !== "offline_access"),
-      accessTtlMs: tunnelTokenTtlMs,
     });
-    tunnelAuthorization = {
-      raw: issued.accessToken,
-      value: `Bearer ${issued.accessToken}`,
-      expiresAt: Date.now() + tunnelTokenTtlMs,
-    };
-    return { value: tunnelAuthorization.value, expiresAt: tunnelAuthorization.expiresAt };
-  };
-  const retireTunnelAuthorizations = (): void => {
-    for (const raw of retiredTunnelAuthorizations) authStore.revokeToken(raw);
-    retiredTunnelAuthorizations.length = 0;
+    tunnelAuthorization = { raw, value: `Bearer ${raw}` };
+    return { value: tunnelAuthorization.value };
   };
   const clearTunnelAuthorization = (): void => {
     if (tunnelAuthorization) authStore.revokeToken(tunnelAuthorization.raw);
-    for (const raw of retiredTunnelAuthorizations) authStore.revokeToken(raw);
-    retiredTunnelAuthorizations.length = 0;
     tunnelAuthorization = null;
   };
   const pairing = new PairingManager(INSTALLATION_WORKSPACE_ID, { ttlMs: opts.pairingTtlMs });
@@ -209,7 +193,6 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
       logger,
       getTunnelAuthorization,
       clearTunnelAuthorization,
-      retireTunnelAuthorizations,
       ownsInstallation
     );
   const adminToken = `c2c_admin_${randomBytes(24).toString("base64url")}`;
@@ -417,8 +400,8 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
   let ownerLock: StateLock | null = null;
   if (ownsInstallation) {
     ownerLock = await acquireStateLockAsync(path.join(getStateDir(), "runtime", "installation-owner.lock"), { timeoutMs: 250 });
-    // Only the verified installation owner may revoke a previous internal
-    // tunnel authorization; a direct second serve must fail at the lock first.
+    // Remove short-lived internal credentials left by older C2C versions;
+    // current tunnel credentials are process-scoped and never persisted.
     try {
       authStore.revokeClientTokens("c2c-openai-tunnel");
     } catch (error) {

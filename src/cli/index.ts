@@ -231,11 +231,19 @@ function tunnelChoicePayload(workspace: Workspace, zoneHint?: string): Record<st
   const selection = selectTunnelProvider(state);
   const openaiConfig = openAiRuntimeConfiguration(process.env, state.tunnelId);
   const openaiSelected = selection.provider === "openai-secure";
+  const selectedModeLabel = openaiSelected
+    ? "OpenAI Secure Tunnel"
+    : state.preference === "quick"
+      ? "Quick temporary address"
+      : state.preference === "named"
+        ? "Named fixed hostname"
+        : "尚未选择连接方式";
   const zone = parseZoneInput(zoneHint ?? "") ?? state.zone ?? null;
   return {
     ok: true,
     needsChoice: needsTunnelChoice(state) && !openaiSelected,
     preference: openaiSelected ? "openai" : state.preference,
+    selectedModeLabel,
     provider: selection.provider,
     loggedIn: hasCloudflaredCert(),
     openaiConfigured: openaiConfig.complete,
@@ -249,6 +257,17 @@ function tunnelChoicePayload(workspace: Workspace, zoneHint?: string): Record<st
     loginPrompt: NAMED_LOGIN_PROMPT,
     fallbackReason: state.fallbackReason,
   };
+}
+
+async function tunnelLiveState(): Promise<{ bridgeRunning: boolean; tunnelRunning: boolean }> {
+  try {
+    const observation = await findInstallationObservation(undefined, runtimeCompatibility());
+    if (observation.state !== "healthy") return { bridgeRunning: false, tunnelRunning: false };
+    const info = await adminFetch<{ tunnel?: { running?: boolean } }>(observation.runtime, "GET", "/admin/info");
+    return { bridgeRunning: true, tunnelRunning: info.tunnel?.running === true };
+  } catch {
+    return { bridgeRunning: false, tunnelRunning: false };
+  }
 }
 
 function trySandboxAllow():
@@ -293,7 +312,6 @@ interface AdminInfo {
     provider: string;
     detail?: string;
     authorizationHealthy?: boolean;
-    authorizationExpiresAt?: number;
   };
   tokenCount: number;
   pairingActive: boolean;
@@ -340,7 +358,17 @@ program
   .name("c2c")
   .description(`${PRODUCT_NAME} — ChatGPT thinks. Codex works.`)
   .version(VERSION, "-v, --version")
-  .configureHelp({ sortSubcommands: true });
+  .configureHelp({ sortSubcommands: true })
+  .addHelpText(
+    "after",
+    `
+Connection choices:
+  Quick = temporary address; Named = fixed hostname; OpenAI = Secure Tunnel.
+  c2c start -w <workspace> --tunnel
+  ChatGPT connector: Connection = Tunnel, Authentication = No authentication.
+  Pairing code: run c2c pair only when the ChatGPT authorization form is open.
+`
+  );
 
 /** Machine-wide commands ignore `-w` so a Skill that always passes it cannot crash them. */
 function acceptUnusedWorkspaceOption(command: Command): Command {
@@ -679,7 +707,7 @@ program
     check(`当前 workspace：${workspace.name}（${currentWorkspace ? "已注册" : "未注册"}）`);
     check(`Bridge：运行中（端口 ${info.port}）`);
     if (info.tunnel.authorizationHealthy === false) {
-      cross(`安全连接：${tunnelDiagnostic ?? "内部授权轮换失败"}`);
+      cross(`安全连接：${tunnelDiagnostic ?? "内部授权不可用"}`);
     } else if (info.tunnel.running && info.tunnel.url) {
       check(`安全连接：${mcpUrlForTunnel(info)}`);
     } else {
@@ -1565,10 +1593,16 @@ tunnelCmd
   .option("-w, --workspace <path>")
   .option("--zone <domain>", "optional domain, used to preview the stable hostname")
   .option("--json", "machine-readable output", false)
-  .action((opts: { workspace?: string; zone?: string; json: boolean }) => {
+  .action(async (opts: { workspace?: string; zone?: string; json: boolean }) => {
     try {
       const workspace = new Workspace(resolveWorkspace(opts.workspace));
-      const payload = tunnelChoicePayload(workspace, opts.zone);
+      const choice = tunnelChoicePayload(workspace, opts.zone) as {
+        needsChoice: boolean;
+        provider: string;
+        namedReady: boolean;
+        hostname: string | null;
+      };
+      const payload = { ...choice, ...(await tunnelLiveState()) };
       if (opts.json) {
         say(JSON.stringify(payload));
         return;

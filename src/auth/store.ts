@@ -43,13 +43,24 @@ export interface TokenRecord {
   revoked: boolean;
 }
 
+/** Process-scoped credential used only by the installation-owned tunnel child. */
+export interface InternalTokenRecord {
+  hash: string;
+  kind: "internal";
+  clientId: string;
+  workspaceId: string;
+  scopes: string[];
+  issuedAt: number;
+  expiresAt?: never;
+}
+
 interface PersistedAuthState {
   clients: ClientRegistration[];
   tokens: TokenRecord[];
 }
 
 export type VerifyTokenResult =
-  | { ok: true; record: TokenRecord }
+  | { ok: true; record: TokenRecord | InternalTokenRecord }
   | { ok: false; reason: "unknown" | "expired" | "revoked" | "wrong_kind" };
 
 const ACCESS_TOKEN_TTL_MS = 60 * 60 * 1000; // 1 hour
@@ -79,6 +90,7 @@ export function safeEqual(a: string, b: string): boolean {
 export class AuthStore {
   private clients = new Map<string, ClientRegistration>();
   private tokens = new Map<string, TokenRecord>();
+  private internalTokens = new Map<string, InternalTokenRecord>();
   private authCodes = new Map<string, AuthorizationCodeRecord>();
   private readonly file: string;
 
@@ -253,8 +265,33 @@ export class AuthStore {
     };
   }
 
+  /**
+   * Issue an installation-owned tunnel credential without persisting it.
+   * Its lifetime is the owning Bridge process, not an arbitrary token TTL.
+   */
+  issueInternalToken(input: {
+    clientId: string;
+    scopes: string[];
+    workspaceId?: string;
+  }): string {
+    const token = newToken("c2c_it");
+    const hash = sha256hex(token);
+    this.internalTokens.set(hash, {
+      hash,
+      kind: "internal",
+      clientId: input.clientId,
+      workspaceId: input.workspaceId ?? this.workspaceId,
+      scopes: input.scopes,
+      issuedAt: Date.now(),
+    });
+    return token;
+  }
+
   verifyAccessToken(token: string): VerifyTokenResult {
-    const record = this.tokens.get(sha256hex(token));
+    const hash = sha256hex(token);
+    const internal = this.internalTokens.get(hash);
+    if (internal) return { ok: true, record: internal };
+    const record = this.tokens.get(hash);
     if (!record) return { ok: false, reason: "unknown" };
     if (record.kind !== "access") return { ok: false, reason: "wrong_kind" };
     if (record.revoked) return { ok: false, reason: "revoked" };
@@ -283,7 +320,9 @@ export class AuthStore {
   }
 
   revokeToken(token: string): boolean {
-    const record = this.tokens.get(sha256hex(token));
+    const hash = sha256hex(token);
+    if (this.internalTokens.delete(hash)) return true;
+    const record = this.tokens.get(hash);
     if (!record) return false;
     record.revoked = true;
     this.tokens.delete(record.hash);
@@ -291,9 +330,14 @@ export class AuthStore {
     return true;
   }
 
-  /** Revoke installation-internal tunnel credentials after daemon restart. */
+  /** Remove legacy persisted tunnel credentials and any live internal credentials. */
   revokeClientTokens(clientId: string): number {
     let count = 0;
+    for (const [hash, token] of this.internalTokens) {
+      if (token.clientId !== clientId) continue;
+      this.internalTokens.delete(hash);
+      count++;
+    }
     for (const [hash, token] of this.tokens) {
       if (token.clientId !== clientId) continue;
       token.revoked = true;
@@ -306,15 +350,16 @@ export class AuthStore {
 
   /** Used by `c2c unpair`: revoke everything for this workspace. */
   revokeAll(): number {
-    const count = this.tokens.size;
+    const count = this.tokens.size + this.internalTokens.size;
     this.tokens.clear();
+    this.internalTokens.clear();
     this.authCodes.clear();
     this.save();
     return count;
   }
 
   tokenCount(): number {
-    return this.tokens.size;
+    return this.tokens.size + this.internalTokens.size;
   }
 
   static deleteStateFile(workspaceId: string): void {

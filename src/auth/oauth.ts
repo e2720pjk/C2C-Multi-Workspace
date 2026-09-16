@@ -14,7 +14,6 @@ export interface OAuthDeps {
   /** Override when the external MCP URL is already path-qualified (OpenAI tunnel). */
   getResourceUrl?: (req: Request, base: string) => string;
   logger: Logger;
-  accessTokenTtlMs?: number;
 }
 
 interface PendingAuthRequest {
@@ -322,7 +321,6 @@ export function createOAuthRouter(deps: OAuthDeps): Router {
       const tokens = deps.store.issueTokens({
         clientId,
         scopes: record.scopes,
-        accessTtlMs: deps.accessTokenTtlMs,
       });
       deps.logger.info(`Issued access token for client ${clientId}`);
       res.json({

@@ -27,7 +27,7 @@
 | Symlink escape | Canonicalization resolves symlinks before the containment check (file and directory symlinks both covered by tests) |
 | Sensitive files | Deny-by-default patterns (.env*, keys, SSH, cloud creds, keychains…) enforced at resolve time — reads, listings, and search all pass through the same gate; `git diff` adds pathspec excludes; `.env.example` allowed |
 | Oversized file / diff DoS | read_file caps lines and bytes per response; git_diff paginates by byte offset with hard caps; search caps matches and file sizes |
-| Tunnel exposure | Bridge binds 127.0.0.1 only (refuses 0.0.0.0); the only public surface is HTTPS via the one installation tunnel, protected by OAuth; `/health` reveals ids/health only |
+| Tunnel exposure | Bridge binds 127.0.0.1 only (refuses 0.0.0.0); the only public surface is HTTPS via the one installation tunnel, protected by the process-bound local bearer or OAuth; `/health` reveals ids/health only |
 | Admin API abuse | Loopback-only + random admin token (0600 runtime file) + requests with proxy headers (`cf-connecting-ip`, `x-forwarded-for`) rejected; unauthenticated probes get 404 |
 | Log credential leakage | Logger redacts token prefixes, bearer headers, token-like parameters, and pairing-code-shaped strings before writing; the OpenAI runtime key is passed only through the tunnel-client environment and never persisted or put in argv |
 | OpenAI tunnel ownership | Installation owner lock and tunnel-client owner lock permit one verified process per installation; health/contract/build identity mismatches fail closed |
@@ -39,11 +39,15 @@
 
 Scopes: `workspace.read`, `workspace.search`, `git.read`, `execution.read`,
 `offline_access`. Tools enforce scopes individually (`INSUFFICIENT_SCOPE`).
-Access tokens: 1 hour. Refresh tokens: 30 days, rotated. Multi-workspace
-installation tokens are bound to the installation and `client_id`; the selected
-workspace is still required to be in the registered, enabled allowlist. The
-installation OAuth store is canonical; no legacy tunnel or workspace-state
-migration is attempted.
+Access tokens: 1 hour. Refresh tokens: 30 days, rotated. The OpenAI Secure
+Tunnel's local MCP bearer is different: it is generated in memory for the
+installation-owned Bridge process, injected into the child through its
+environment, and revoked when the Bridge stops or the child loses its channel;
+it is not an OAuth token, persisted credential, or periodic-rotation trigger.
+Multi-workspace installation tokens are bound to the installation and
+`client_id`; the selected workspace is still required to be in the registered,
+enabled allowlist. The installation OAuth store is canonical; legacy
+short-lived tunnel tokens are discarded on startup.
 
 ## Storage
 
