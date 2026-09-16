@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - fix/stable-openai-tunnel-auth
+  pull_request:
+    branches:
+      - main
 
 jobs:
   validate:
