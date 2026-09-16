@@ -1,21 +1,37 @@
+import { timingSafeEqual } from "node:crypto";
 import type { NextFunction, Request, Response } from "express";
 import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
 import type { AuthStore } from "./store.js";
 import type { Logger } from "../logger/index.js";
 
+export interface InternalBearer {
+  token: string;
+  clientId: string;
+  scopes: string[];
+}
+
 export interface BearerAuthDeps {
   store: AuthStore;
   /** Legacy single-workspace audience check. Omit for installation tokens. */
   workspaceId?: string;
+  /** Installation-owned bearer used only by the loopback tunnel-client binding. */
+  internalBearer?: InternalBearer;
   getBaseUrl: (req: Request) => string;
   logger: Logger;
 }
 
+function secureTokenEqual(actual: string, expected: string): boolean {
+  const actualBytes = Buffer.from(actual);
+  const expectedBytes = Buffer.from(expected);
+  return actualBytes.length === expectedBytes.length && timingSafeEqual(actualBytes, expectedBytes);
+}
+
 /**
  * Bearer-token guard for /mcp.
- * - missing/invalid/expired token  -> 401 (+ WWW-Authenticate with resource metadata)
- * - valid token for another legacy workspace -> 403
- * Installation-wide tokens omit the workspace audience check.
+ * - the installation-owned tunnel bearer is accepted directly and never persisted
+ * - missing/invalid/expired OAuth token -> 401 (+ WWW-Authenticate with resource metadata)
+ * - valid OAuth token for another legacy workspace -> 403
+ * Installation-wide OAuth tokens omit the workspace audience check.
  */
 export function bearerAuth(deps: BearerAuthDeps) {
   return (req: Request, res: Response, next: NextFunction): void => {
@@ -32,6 +48,17 @@ export function bearerAuth(deps: BearerAuthDeps) {
       return;
     }
     const token = header.slice(7).trim();
+    if (deps.internalBearer && secureTokenEqual(token, deps.internalBearer.token)) {
+      const authInfo: AuthInfo = {
+        token,
+        clientId: deps.internalBearer.clientId,
+        scopes: [...deps.internalBearer.scopes],
+      };
+      (req as Request & { auth?: AuthInfo }).auth = authInfo;
+      next();
+      return;
+    }
+
     const verdict = deps.store.verifyAccessToken(token);
     if (!verdict.ok) {
       deps.logger.warn(`Rejected MCP request: token ${verdict.reason}`);
