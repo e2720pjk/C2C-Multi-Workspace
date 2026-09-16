@@ -1,12 +1,16 @@
 import type { NextFunction, Request, Response } from "express";
 import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
-import type { AuthStore } from "./store.js";
+import { safeEqual, type AuthStore } from "./store.js";
 import type { Logger } from "../logger/index.js";
 
 export interface BearerAuthDeps {
   store: AuthStore;
   /** Legacy single-workspace audience check. Omit for installation tokens. */
   workspaceId?: string;
+  /** Bridge-lifetime bearer used only by the installation-owned tunnel-client. */
+  internalToken?: string;
+  /** Tool scopes granted to the internal tunnel-client bearer. */
+  internalScopes?: string[];
   getBaseUrl: (req: Request) => string;
   logger: Logger;
 }
@@ -15,7 +19,8 @@ export interface BearerAuthDeps {
  * Bearer-token guard for /mcp.
  * - missing/invalid/expired token  -> 401 (+ WWW-Authenticate with resource metadata)
  * - valid token for another legacy workspace -> 403
- * Installation-wide tokens omit the workspace audience check.
+ * Installation-wide OAuth tokens omit the workspace audience check.
+ * The optional internal token is process-local and is not part of the OAuth store.
  */
 export function bearerAuth(deps: BearerAuthDeps) {
   return (req: Request, res: Response, next: NextFunction): void => {
@@ -32,6 +37,18 @@ export function bearerAuth(deps: BearerAuthDeps) {
       return;
     }
     const token = header.slice(7).trim();
+
+    if (deps.internalToken && safeEqual(token, deps.internalToken)) {
+      const authInfo: AuthInfo = {
+        token,
+        clientId: "c2c-openai-tunnel",
+        scopes: deps.internalScopes ?? [],
+      };
+      (req as Request & { auth?: AuthInfo }).auth = authInfo;
+      next();
+      return;
+    }
+
     const verdict = deps.store.verifyAccessToken(token);
     if (!verdict.ok) {
       deps.logger.warn(`Rejected MCP request: token ${verdict.reason}`);
