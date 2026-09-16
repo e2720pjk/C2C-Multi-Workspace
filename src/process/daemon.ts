@@ -57,16 +57,16 @@ function ownerLockFile(): string {
   return path.join(getStateDir(), "runtime", "installation-owner.lock");
 }
 
-function expectedIdentity(identity: ReturnType<typeof readInstallationIdentity>): {
+function expectedIdentity(identity: ReturnType<typeof readInstallationIdentity>, requireCurrentBuild = true): {
   expectedInstallationId: string;
   expectedContractId: string;
-  expectedBuildId: string;
+  expectedBuildId?: string;
 } {
   if (!identity) throw new Error("C2C installation identity is unavailable.");
   return {
     expectedInstallationId: identity.installationId,
     expectedContractId: RUNTIME_CONTRACT_ID,
-    expectedBuildId: RUNTIME_BUILD_ID,
+    ...(requireCurrentBuild ? { expectedBuildId: RUNTIME_BUILD_ID } : {}),
   };
 }
 
@@ -121,19 +121,15 @@ export async function ensureBridge(
       return { runtime: await refreshInstallationRuntime(observation.runtime), spawned: false };
     }
     if (observation.state === "unknown") {
-      if (observation.reason === "build_mismatch" && observation.runtime && identity) {
-        await shutdownOwnedRuntime(observation.runtime, identity.installationId);
-        observation = await findInstallationObservation(workspace.id, {
-          expectedInstallationId: identity.installationId,
-          expectedContractId: RUNTIME_CONTRACT_ID,
-          expectedBuildId: RUNTIME_BUILD_ID,
-        });
+      if (observation.reason === "build_mismatch" && identity) {
+        const manageable = await findInstallationObservation(workspace.id, expectedIdentity(identity, false));
+        if (manageable.state === "healthy") {
+          return { runtime: await refreshInstallationRuntime(manageable.runtime), spawned: false };
+        }
       }
-      if (observation.state === "unknown") {
-        throw new Error(
-          `Bridge state is uncertain (${observation.reason}); refusing to start another bridge.`
-        );
-      }
+      throw new Error(
+        `Bridge state is uncertain (${observation.reason}); refusing to start another bridge.`
+      );
     }
     const owner = inspectStateLock(ownerLockFile());
     if (owner.state === "held") {
@@ -149,15 +145,15 @@ export async function ensureBridge(
       return { runtime: await refreshInstallationRuntime(observation.runtime), spawned: false };
     }
     if (observation.state === "unknown") {
-      if (observation.reason === "build_mismatch" && observation.runtime) {
-        await shutdownOwnedRuntime(observation.runtime, identity.installationId);
-        observation = await findInstallationObservation(workspace.id, expected);
+      if (observation.reason === "build_mismatch") {
+        const manageable = await findInstallationObservation(workspace.id, expectedIdentity(identity, false));
+        if (manageable.state === "healthy") {
+          return { runtime: await refreshInstallationRuntime(manageable.runtime), spawned: false };
+        }
       }
-      if (observation.state === "unknown") {
-        throw new Error(
-          `Bridge state is uncertain (${observation.reason}); refusing to start another bridge.`
-        );
-      }
+      throw new Error(
+        `Bridge state is uncertain (${observation.reason}); refusing to start another bridge.`
+      );
     }
 
     const logDir = ensureDir(path.join(getStateDir(), "logs"));
@@ -236,7 +232,7 @@ interface AdminRuntimeProof {
 }
 
 /**
- * Build compatibility is a reuse check, not an ownership check. This proof
+ * Build identity is an update check, not an ownership check. This proof
  * deliberately ignores the expected build while requiring every independent
  * ownership signal before asking an older daemon to shut itself down.
  */

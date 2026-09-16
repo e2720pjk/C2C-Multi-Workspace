@@ -99,11 +99,11 @@ because the preferred port is occupied.
 
 `status`, `stop`, and `restart` distinguish `healthy`, `stopped`, and
 `unknown/conflicting`. Corrupt state, a failed health probe, an unverifiable
-PID, or a contract mismatch is reported and fails closed. A build mismatch is
-not reusable, but an owner-lease, health, and authenticated-admin proof lets
-`start`/`stop` gracefully shut down that same-installation daemon before
-replacement; lifecycle code
-does not kill a PID it cannot attribute to this installation.
+PID, or a contract mismatch is reported and fails closed. A same-contract older
+build remains manageable and `start` reuses it; an explicit `restart` replaces
+it only after owner-lease, process-identity, health, and authenticated-admin
+proof. Lifecycle code does not kill a PID it cannot attribute to this
+installation.
 
 The registry and installation identity use owner-only, atomically replaced JSON
 under an installation lock. Runtime and tunnel state are installation-owned;

@@ -67,11 +67,11 @@ authorization code → `/oauth/token` (PKCE S256) → access + refresh tokens.
 
 **Lifecycle/ports**: prefer 48765, bind 127.0.0.1 only. A state-directory
 startup lock serializes check-and-spawn, and the daemon holds an installation
-owner lock for its lifetime; a compatible `/health` + runtime/contract/build
-identity is reused. A build-mismatched daemon is replaced only after the same-
-installation owner lease, process identity, health, and authenticated admin
-endpoint all verify; unknown/conflicting owners are never killed or silently
-reused.
+owner lock for its lifetime. A compatible `/health` response plus verified
+installation, process, and runtime-contract identity is reusable across builds;
+an explicit restart replaces an older build only after the owner lease, process
+identity, health, and authenticated admin endpoint all verify. Unknown or
+conflicting owners are never killed or silently reused.
 A non-C2C occupant may still cause the single owner to fall back to an ephemeral
 port. Configuration follows via installation runtime state; users never manage
 ports. Registering another root updates the allowlist without starting a second

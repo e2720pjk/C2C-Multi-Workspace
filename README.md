@@ -186,8 +186,8 @@ one C2C Connector / MCP endpoint
 ## Lifecycle and safety
 
 - An installation has one daemon and one installation-owned tunnel.
-- An incompatible build is not silently reused.
-- A same-contract build upgrade can replace a daemon only after ownership and admin authority are verified.
+- `start` and diagnostics reuse an ownership-verified daemon with the same runtime contract, even when its build differs.
+- An explicit `restart` upgrades that daemon only after ownership and admin authority are verified; a contract mismatch still fails closed.
 - An unverifiable PID, reused PID, corrupt lock, or unknown owner is never killed directly.
 - Corrupt or unsupported canonical state fails closed.
 

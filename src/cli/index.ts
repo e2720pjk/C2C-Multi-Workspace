@@ -75,10 +75,10 @@ function resolveWorkspace(option?: string): string {
   return path.resolve(option ?? process.cwd());
 }
 
-function runtimeCompatibility(): {
+function runtimeCompatibility(requireCurrentBuild = true): {
   expectedInstallationId: string;
   expectedContractId: string;
-  expectedBuildId: string;
+  expectedBuildId?: string;
 } {
   let identity: ReturnType<typeof readInstallationIdentity> = null;
   try {
@@ -91,7 +91,7 @@ function runtimeCompatibility(): {
     // A missing or corrupt identity is not proof that an active daemon belongs to this CLI.
     expectedInstallationId: identity?.installationId ?? "missing-installation-identity",
     expectedContractId: RUNTIME_CONTRACT_ID,
-    expectedBuildId: RUNTIME_BUILD_ID,
+    ...(requireCurrentBuild ? { expectedBuildId: RUNTIME_BUILD_ID } : {}),
   };
 }
 
@@ -261,7 +261,7 @@ function tunnelChoicePayload(workspace: Workspace, zoneHint?: string): Record<st
 
 async function tunnelLiveState(): Promise<{ bridgeRunning: boolean; tunnelRunning: boolean }> {
   try {
-    const observation = await findInstallationObservation(undefined, runtimeCompatibility());
+    const observation = await findInstallationObservation(undefined, runtimeCompatibility(false));
     if (observation.state !== "healthy") return { bridgeRunning: false, tunnelRunning: false };
     const info = await adminFetch<{ tunnel?: { running?: boolean } }>(observation.runtime, "GET", "/admin/info");
     return { bridgeRunning: true, tunnelRunning: info.tunnel?.running === true };
@@ -554,7 +554,7 @@ program
   .action(async (opts: { workspace?: string; json: boolean }) => {
     const root = resolveWorkspace(opts.workspace);
     const workspace = new Workspace(root);
-    const observation = await findInstallationObservation(undefined, runtimeCompatibility());
+    const observation = await findInstallationObservation(undefined, runtimeCompatibility(false));
     if (observation.state === "unknown") {
       if (opts.json) {
         say(
@@ -771,7 +771,7 @@ program
     let runtime: RuntimeState | null = null;
     let bridgeUnknown = false;
     if (workspace) {
-      const observation = await findInstallationObservation(undefined, runtimeCompatibility());
+      const observation = await findInstallationObservation(undefined, runtimeCompatibility(false));
       if (observation.state === "healthy") {
         runtime = observation.runtime;
       } else if (observation.state === "unknown") {
@@ -1106,7 +1106,7 @@ program
   .action(async (opts: { workspace?: string }) => {
     const root = resolveWorkspace(opts.workspace);
     const workspace = new Workspace(root);
-    const installation = await findInstallationObservation(undefined, runtimeCompatibility());
+    const installation = await findInstallationObservation(undefined, runtimeCompatibility(false));
     const runtime = installation.state === "healthy" ? installation.runtime : null;
     if (runtime) {
       await adminFetch(runtime, "POST", "/admin/revoke-all");

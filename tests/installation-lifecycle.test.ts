@@ -12,23 +12,34 @@ import { Workspace } from "../src/workspace/manager.js";
 import { workspaceRegistryFile, WorkspaceRegistry } from "../src/workspace/registry.js";
 import { cleanup, isolateStateDir, makeTmpDir, write } from "./helpers.js";
 
-function runCli(
-  args: string[],
+function runNodeCli(
+  nodeArgs: string[],
   state: string,
   env: NodeJS.ProcessEnv = {}
 ): Promise<{ code: number | null; stdout: string; stderr: string }> {
   return new Promise((resolve) => {
-    const child = spawn(
-      process.execPath,
-      ["--import", "tsx/esm", path.join(process.cwd(), "src", "cli", "index.ts"), ...args],
-      { env: { ...process.env, ...env, C2C_STATE_DIR: state }, stdio: ["ignore", "pipe", "pipe"] }
-    );
+    const child = spawn(process.execPath, nodeArgs, {
+      env: { ...process.env, ...env, C2C_STATE_DIR: state },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
     let stdout = "";
     let stderr = "";
     child.stdout.on("data", (chunk) => { stdout += chunk.toString(); });
     child.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
     child.once("close", (code) => resolve({ code, stdout, stderr }));
   });
+}
+
+function runCli(
+  args: string[],
+  state: string,
+  env: NodeJS.ProcessEnv = {}
+): Promise<{ code: number | null; stdout: string; stderr: string }> {
+  return runNodeCli(["--import", "tsx/esm", path.join(process.cwd(), "src", "cli", "index.ts"), ...args], state, env);
+}
+
+function runOfficialCli(args: string[], state: string): Promise<{ code: number | null; stdout: string; stderr: string }> {
+  return runNodeCli([path.join(process.cwd(), "bin", "c2c.js"), ...args], state);
 }
 
 function runCliStart(root: string, state: string): Promise<{ code: number | null; stdout: string; stderr: string }> {
@@ -78,6 +89,49 @@ describe("installation lifecycle ownership", () => {
     }
   });
 
+  it("manages a healthy service through the official CLI start/status/restart/stop lifecycle", async () => {
+    const state = isolateStateDir();
+    const root = makeTmpDir("lifecycle-official-cli");
+    dirs.push(state, root);
+    write(root, "a.txt", "a");
+
+    try {
+      const started = await runOfficialCli(["start", "--workspace", root, "--json"], state);
+      expect(started.code, started.stderr).toBe(0);
+
+      const before = await runOfficialCli(["status", "--workspace", root, "--json"], state);
+      expect(before.code, before.stderr).toBe(0);
+      const beforeStatus = JSON.parse(before.stdout.trim()) as { running: boolean; compatible: boolean; pid: number; port: number };
+      expect(beforeStatus).toMatchObject({ running: true, compatible: true });
+      const mcpBefore = await fetch(`http://127.0.0.1:${beforeStatus.port}/mcp`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ jsonrpc: "2.0", method: "ping", id: 1 }),
+      });
+      expect(mcpBefore.status).toBe(401);
+      const doctor = await runOfficialCli(["doctor", "--workspace", root, "--no-fix", "--json"], state);
+      expect(doctor.code, doctor.stderr).toBe(0);
+      expect(JSON.parse(doctor.stdout.trim())).toMatchObject({
+        report: { bridge: { ok: true }, mcp: { ok: true } },
+      });
+
+      const restarted = await runOfficialCli(["restart", "--workspace", root], state);
+      expect(restarted.code, restarted.stderr).toBe(0);
+      const after = await runOfficialCli(["status", "--workspace", root, "--json"], state);
+      expect(after.code, after.stderr).toBe(0);
+      const afterStatus = JSON.parse(after.stdout.trim()) as { running: boolean; compatible: boolean; pid: number; port: number };
+      expect(afterStatus).toMatchObject({ running: true, compatible: true });
+      expect(afterStatus.pid).not.toBe(beforeStatus.pid);
+
+      const stopped = await runOfficialCli(["stop", "--workspace", root], state);
+      expect(stopped.code, stopped.stderr).toBe(0);
+      const finalStatus = await runOfficialCli(["status", "--workspace", root, "--json"], state);
+      expect(JSON.parse(finalStatus.stdout.trim())).toMatchObject({ running: false, state: "stopped" });
+    } finally {
+      await stopBridge().catch(() => undefined);
+    }
+  });
+
   it("serializes concurrent installation starts and reuses one daemon", async () => {
     const state = isolateStateDir();
     const a = makeTmpDir("lifecycle-a");
@@ -110,7 +164,7 @@ describe("installation lifecycle ownership", () => {
     expect(() => new WorkspaceRegistry()).toThrow(/registry is not valid JSON/i);
   });
 
-  it("gracefully replaces an owned daemon from an incompatible build", async () => {
+  it("lets a reinstalled official CLI reuse then explicitly restart an owned same-contract daemon", async () => {
     const state = isolateStateDir();
     const root = makeTmpDir("lifecycle-upgrade");
     dirs.push(state, root);
@@ -122,17 +176,26 @@ describe("installation lifecycle ownership", () => {
       runtimeBuildId: "c2c-build-test-a",
       exitOnShutdown: false,
     });
-    const replacement = await ensureBridge(root);
     try {
-      expect(replacement.spawned).toBe(true);
-      expect(replacement.runtime.buildId).toBe(RUNTIME_BUILD_ID);
-      expect(replacement.runtime.port).toBeGreaterThan(0);
-      expect(replacement.runtime.pid).not.toBe(process.pid);
-      expect((await findInstallationObservation(undefined, {
-        expectedInstallationId: old.installationId,
-        expectedContractId: RUNTIME_CONTRACT_ID,
-        expectedBuildId: RUNTIME_BUILD_ID,
-      })).state).toBe("healthy");
+      const before = await runOfficialCli(["status", "--workspace", root, "--json"], state);
+      expect(before.code, before.stderr).toBe(0);
+      expect(JSON.parse(before.stdout.trim())).toMatchObject({ running: true, compatible: true, pid: process.pid });
+
+      const reused = await runOfficialCli(["start", "--workspace", root, "--json"], state);
+      expect(reused.code, reused.stderr).toBe(0);
+      const afterStart = await runOfficialCli(["status", "--workspace", root, "--json"], state);
+      expect(JSON.parse(afterStart.stdout.trim())).toMatchObject({ running: true, pid: process.pid });
+      const doctor = await runOfficialCli(["doctor", "--workspace", root, "--no-fix", "--json"], state);
+      expect(doctor.code, doctor.stderr).toBe(0);
+      expect(JSON.parse(doctor.stdout.trim())).toMatchObject({ report: { bridge: { ok: true }, mcp: { ok: true } } });
+
+      const restarted = await runOfficialCli(["restart", "--workspace", root], state);
+      expect(restarted.code, restarted.stderr).toBe(0);
+      const status = await runOfficialCli(["status", "--workspace", root, "--json"], state);
+      expect(status.code, status.stderr).toBe(0);
+      const current = JSON.parse(status.stdout.trim()) as { running: boolean; compatible: boolean; pid: number };
+      expect(current).toMatchObject({ running: true, compatible: true });
+      expect(current.pid).not.toBe(process.pid);
     } finally {
       await stopBridge();
       await old.close();

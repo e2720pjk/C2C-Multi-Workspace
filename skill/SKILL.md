@@ -188,11 +188,10 @@ that close the tab, hide the window, or stall on the settings page.
 
 - The codex-with-chatgpt checkout lives at: `<ACTUAL_CHECKOUT_PATH>`
   (installer/update MUST replace this line in the installed Skill with the user's actual checkout path.)
-- CLI: let `<checkout>` mean the path on the previous line; run
-  `node "<checkout>/bin/c2c.js" <command>` (or `c2c <command>` if globally linked).
-  All commands support `--json` for parsing.
-- If the checkout has no `node_modules` or no `dist/`, first run
-  `corepack pnpm install && corepack pnpm build` inside it.
+- CLI: `c2c` is the single supported management entry point. All commands
+  support `--json` for parsing. Before a workflow, verify `c2c --help`. If it
+  is unavailable, run `corepack pnpm install && corepack pnpm build &&
+  pnpm install -g .` inside `<checkout>`, then verify `c2c --help` again.
 - For commands that act on the user's project (`setup`, `doctor`, `session`,
   `restart`, `start`, `stop`, `status`, `pair`, `unpair`, `logs`, `workspace`,
   `record`, `tunnel status`, `tunnel choose`), pass `-w <workspace root>`
