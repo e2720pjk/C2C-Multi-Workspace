@@ -1,5 +1,6 @@
 import path from "node:path";
 import { getStateDir, readJsonIfExists, writeSecureJson } from "./paths.js";
+import { LANGUAGES, t, type Language } from "./language.js";
 
 export type SetupMode = "auto" | "manual";
 
@@ -7,28 +8,27 @@ export const SETUP_MODES: readonly SetupMode[] = ["auto", "manual"];
 
 /** Shown once, before the first ChatGPT connection on this machine. */
 export const SETUP_CHOICE_PROMPT = [
-  "首次连接 ChatGPT 前，请选择一种配置方式（选一次即可，之后默认沿用）：",
+  "Choose how to configure ChatGPT once on this machine:",
   "",
-  "**1. AI 自动化配置（预览版）**",
-  "由我在内置浏览器里完成全部设置，你只需在需要登录、验证码或二次确认时操作一次。",
-  "优点：几乎不用自己点页面。",
-  "缺点：步骤多，整体更慢；若自动设置连续两次无法完成，会改为「手动教学配置」。",
+  "1. AI-assisted setup (preview)",
+  "An agent configures ChatGPT in the browser. You handle login, CAPTCHA, and confirmations.",
+  "If the same setup step fails twice, switch to guided manual setup.",
   "",
-  "**2. 手动教学配置**",
-  "我逐步告诉你打开哪个页面、填写哪几项，由你在浏览器里完成点击。",
-  "优点：大约 3 分钟可以完成，过程可控、更稳定。",
-  "缺点：需要你按提示操作，不能完全放手。",
+  "2. Guided manual setup",
+  "Follow step-by-step instructions and configure ChatGPT yourself.",
   "",
-  "请回复「1」或「2」。未说明时，不要自行开始配置。",
+  "Reply with 1 or 2 before an agent starts browser setup.",
 ].join("\n");
 
 interface StoredUiPrefs {
   developerModeEnabled?: boolean;
   setupMode?: SetupMode;
+  language?: Language;
   updatedAt: string;
 }
 
 export interface UiPrefsView {
+  language: Language;
   developerModeEnabled: boolean;
   setupMode: SetupMode | null;
   setupChoicePrompt: string;
@@ -49,6 +49,7 @@ function readStored(): StoredUiPrefs | null {
   return {
     developerModeEnabled: raw.developerModeEnabled === true,
     setupMode,
+    language: raw.language === "en" || raw.language === "zh-TW" ? raw.language : undefined,
     updatedAt: typeof raw.updatedAt === "string" ? raw.updatedAt : new Date().toISOString(),
   };
 }
@@ -58,9 +59,21 @@ export function readUiPrefs(): UiPrefsView {
   const developerModeEnabled = stored?.developerModeEnabled === true;
   const setupMode = stored?.setupMode ?? null;
   return {
+    language: stored?.language ?? "en",
     developerModeEnabled,
     setupMode,
-    setupChoicePrompt: SETUP_CHOICE_PROMPT,
+    setupChoicePrompt: t(SETUP_CHOICE_PROMPT, [
+      "請選擇此電腦的 ChatGPT 設定方式（只需選擇一次）：",
+      "",
+      "1. AI 協助設定（預覽版）",
+      "Agent 在瀏覽器完成設定；登入、驗證碼與確認步驟由你處理。",
+      "相同設定步驟失敗兩次後，改用手動教學設定。",
+      "",
+      "2. 手動教學設定",
+      "依照逐步指引，自行完成 ChatGPT 設定。",
+      "",
+      "請回覆 1 或 2，再讓 Agent 開始瀏覽器設定。",
+    ].join("\n")),
     remembered: {
       developerMode: developerModeEnabled,
       setupMode: setupMode !== null,
@@ -69,6 +82,7 @@ export function readUiPrefs(): UiPrefsView {
 }
 
 export interface UiPrefsPatch {
+  language?: Language;
   developerModeEnabled?: true;
   setupMode?: SetupMode;
 }
@@ -76,6 +90,9 @@ export interface UiPrefsPatch {
 export function mergeUiPrefs(patch: UiPrefsPatch): UiPrefsView {
   if (patch.setupMode !== undefined && !SETUP_MODES.includes(patch.setupMode)) {
     throw new Error(`setup-mode must be one of ${SETUP_MODES.join(", ")}`);
+  }
+  if (patch.language !== undefined && !LANGUAGES.includes(patch.language)) {
+    throw new Error(`language must be one of ${LANGUAGES.join(", ")}`);
   }
   const previous = readStored();
   const setupMode = patch.setupMode ?? previous?.setupMode;
@@ -88,6 +105,8 @@ export function mergeUiPrefs(patch: UiPrefsPatch): UiPrefsView {
     stored.developerModeEnabled = true;
   }
   if (setupMode) stored.setupMode = setupMode;
+  const language = patch.language ?? previous?.language;
+  if (language) stored.language = language;
   writeSecureJson(prefsFile(), stored);
   return readUiPrefs();
 }

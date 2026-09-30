@@ -25,9 +25,10 @@ describe("ui prefs", () => {
     expect(prefs.setupMode).toBeNull();
     expect(prefs.remembered).toEqual({ developerMode: false, setupMode: false });
     expect(prefs.setupChoicePrompt).toBe(SETUP_CHOICE_PROMPT);
-    expect(prefs.setupChoicePrompt).toContain("AI 自动化配置（预览版）");
-    expect(prefs.setupChoicePrompt).toContain("手动教学配置");
-    expect(prefs.setupChoicePrompt).toContain("请回复「1」或「2」");
+    expect(prefs.language).toBe("en");
+    expect(prefs.setupChoicePrompt).toContain("AI-assisted setup (preview)");
+    expect(prefs.setupChoicePrompt).toContain("Guided manual setup");
+    expect(prefs.setupChoicePrompt).not.toMatch(/\p{Script=Han}/u);
   });
 
   it("remembers developer mode as on only, never as off", () => {
@@ -48,6 +49,14 @@ describe("ui prefs", () => {
     const auto = mergeUiPrefs({ setupMode: "auto" });
     expect(auto.setupMode).toBe("auto");
     expect(auto.developerModeEnabled).toBe(true);
+  });
+
+  it("preserves language across other preference updates and rejects ambiguous locales", () => {
+    dirs.push(isolateStateDir());
+    mergeUiPrefs({ language: "zh-TW" });
+    expect(mergeUiPrefs({ setupMode: "manual" })).toMatchObject({ language: "zh-TW", setupChoicePrompt: expect.stringContaining("請選擇") });
+    expect(() => mergeUiPrefs({ language: "zh" as "en" })).toThrow(/language/);
+    expect(mergeUiPrefs({ language: "en" }).setupMode).toBe("manual");
   });
 
   it("rejects an unknown setup mode", () => {

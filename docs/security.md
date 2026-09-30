@@ -4,8 +4,8 @@
 
 1. **Registered workspace root** is the smallest read authorization boundary.
    One installation bridge serves an explicit registry; every workspace-dependent
-   request resolves one enabled id/alias (or the persisted default). OAuth
-   authorizes the installation endpoint, while the registry prevents a request
+   request resolves one enabled id/alias (or the persisted default). Pairing OAuth
+   or the Secure Tunnel's local bearer authorizes the installation endpoint, while the registry prevents a request
    for A from reading B or an unregistered root.
 2. **Workspace content is untrusted.** README, comments, diffs may contain
    prompt injection. Every MCP tool description carries an explicit warning and
@@ -18,7 +18,7 @@
 
 | Threat | Mitigation |
 | --- | --- |
-| MCP URL leaks | URL alone is useless: every `/mcp` request requires a valid bearer token (401 without); tokens authorize the installation endpoint and cannot add roots to the registry |
+| MCP URL leaks | Local `/mcp` always requires a bearer. Pairing's public endpoint requires OAuth; Secure's upstream access is governed by OpenAI, while C2C accepts only its process-bound internal bearer locally. Neither credential can add workspace roots |
 | Pairing code brute force | 8 chars from a 31-char CSPRNG alphabet (~40 bits), 5 attempts per session, per-IP rate limit (10/min), 5-minute TTL, one-time use, session destroyed on limit |
 | OAuth CSRF | `state` round-tripped verbatim; authorization requests are server-side records keyed by random ids |
 | Code interception | PKCE S256 mandatory (plain rejected); authorization codes are one-time, 5-minute TTL, bound to client + redirect URI |
@@ -47,7 +47,11 @@ it is not an OAuth token, persisted credential, or periodic-rotation trigger.
 Multi-workspace installation tokens are bound to the installation and
 `client_id`; the selected workspace is still required to be in the registered,
 enabled allowlist. The installation OAuth store is canonical; legacy
-short-lived tunnel tokens are discarded on startup.
+short-lived tunnel tokens are discarded on startup. Secure mode disables OAuth
+and discovery routes, refuses `/admin/pairing`, and rejects persisted OAuth tokens
+even if they belong to this installation. Pairing is an explicit profile choice;
+missing Secure credentials never enable it. `c2c unpair` revokes Pairing access
+for all registered workspaces; it does not revoke upstream OpenAI access.
 
 ## Storage
 

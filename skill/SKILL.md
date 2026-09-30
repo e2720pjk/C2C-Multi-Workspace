@@ -12,6 +12,12 @@ description: >
 
 ChatGPT thinks. Codex works.
 
+The CLI is the primary product interface; this Skill is an optional caller.
+An unconfigured installation defaults to OpenAI Secure Tunnel. Never select
+Pairing automatically because Secure credentials or `tunnel-client` are missing.
+Read `c2c prefs --json` for the explicit `language` (`en` by default, or `zh-TW`)
+and use CLI-provided localized prompts rather than hard-coded Chinese replies.
+
 You (Codex) own execution: editing, shell, git, tests, recovery.
 ChatGPT owns high-level reasoning: understanding, planning, review, debug strategy.
 The C2C Bridge gives ChatGPT read-only MCP access to registered workspaces, so
@@ -21,10 +27,9 @@ whatever data it needs by itself and selects a workspace per request.
 **Golden rules**
 
 1. NEVER paste file contents, diffs, or logs into ChatGPT. ChatGPT reads them through MCP.
-2. NEVER show the user technical internals (MCP, OAuth, PKCE, tunnel, ports, localhost).
-   Speak in terms of "连接 ChatGPT / 安全连接 / 配对". The only exception is the
-   **guided manual ChatGPT setup** below: expose only the exact settings
-   field labels/values the user must enter, without explaining internals.
+2. Use accurate CLI terms: Secure Tunnel is the default connection profile;
+   Pairing is an explicit Cloudflare + OAuth alternative. Show useful commands
+   and exact ChatGPT setting values when needed; never show raw credentials.
 3. The pairing code is the ONLY credential you may ever type into a browser.
    Never touch OAuth tokens, cookies, or session storage.
 4. If something fails, run `c2c doctor` and repair silently. Only involve the user
@@ -74,10 +79,10 @@ whatever data it needs by itself and selects a workspace per request.
    ChatGPT discovers them with `list_workspaces` and passes the returned id or
    alias as `workspace` on each workspace-dependent tool call. Never edit or
    create another connector just to add, remove, enable, or select a workspace.
-7. After first-time setup, never ask the user to approve writing C2C's local
-   settings directory. Run `c2c sandbox-allow --json` (idempotent). If it fails
-   with EPERM / Operation not permitted, request elevated permissions and retry
-   ONCE. After `{ "alreadyAllowed": true }` or `{ "added": true }`, stay silent.
+7. `setup` and `doctor` already prepare the Codex sandbox allowlist. Do not
+   repeat `sandbox-allow` immediately before them. For an independent state-dir
+   write failure, run `c2c sandbox-allow --json`; if it fails with EPERM, request
+   elevated permissions and retry once.
 8. ChatGPT pages: only the URLs in **In-app browser (ChatGPT)**. Never start
    from chatgpt.com and click through menus.
 9. **Doctor gate.** After `c2c doctor --json`, do not `goto` ChatGPT and do not
@@ -94,7 +99,7 @@ whatever data it needs by itself and selects a workspace per request.
      `NEED_OPENAI_TUNNEL_CLIENT` / missing runtime credentials. Install the official
      `tunnel-client` or provide `CONTROL_PLANE_TUNNEL_ID` and
      `CONTROL_PLANE_API_KEY`; never ask for `OPENAI_ADMIN_KEY`.
-   - `report.bridge` says 状态无法确认: the local bridge may still be running.
+   - `report.bridge` reports an uncertain state: the local bridge may still be running.
      Do not `c2c start`, do not Delete the connector, do not treat it as
      `chatgptRepair`. Wait and run doctor again.
    If doctor is already green and `chatgptRepair.needed` is false, do not
@@ -189,30 +194,23 @@ that close the tab, hide the window, or stall on the settings page.
 - The codex-with-chatgpt checkout lives at: `<ACTUAL_CHECKOUT_PATH>`
   (installer/update MUST replace this line in the installed Skill with the user's actual checkout path.)
 - CLI: `c2c` is the single supported management entry point. All commands
-  support `--json` for parsing. Before a workflow, verify `c2c --help`. If it
+  expose JSON on status/management operations. Before a workflow, verify `c2c --help`. If it
   is unavailable, run `corepack pnpm install && corepack pnpm build &&
   pnpm install -g .` inside `<checkout>`, then verify `c2c --help` again.
-- For commands that act on the user's project (`setup`, `doctor`, `session`,
-  `restart`, `start`, `stop`, `status`, `pair`, `unpair`, `logs`, `workspace`,
-  `record`, `tunnel status`, `tunnel choose`), pass `-w <workspace root>`
-  (the project the user is working on, NOT the c2c repo). To manage the
-  installation allowlist use `c2c workspace add/list/set-default/enable/disable/remove`;
-  `workspace list` does not expose absolute roots.
-- Do not add `-w` to machine-wide commands: `update-check`, `sandbox-allow`,
-  `prefs`, `tunnel login`. They still accept and ignore `-w`, so a leftover
-  flag must not fail the command.
+- Workspace-specific operations (`setup`, `doctor`, `session`, `restart`,
+  `start`, `status`, bare `workspace`, `record`) use cwd or `-w <workspace root>`
+  (the user's project, not the C2C checkout).
+- Register with `c2c workspace add [path]`; never require `-w`. Registry mutations
+  use an id/alias, not a filesystem path. `workspace list` hides local roots.
+- `stop`, `pair`, `unpair`, `logs`, `connection`, `prefs`, `update-check`, and
+  `sandbox-allow` are installation-wide. Do not pass `-w`; compatibility flags
+  on older call shapes are ignored, never a workspace access boundary.
 
 ## Daily update check
 
-At the START of every workflow below (before anything else), run these two
-commands (both are cheap / cached; never mention them unless an update exists):
-
-1. `c2c update-check --json` (do not pass `-w`)
-2. `c2c sandbox-allow --json` (do not pass `-w`) — writes the C2C state directory into Codex's
-   sandbox `writable_roots` (macOS: `~/Library/Application Support/codex-with-chatgpt`;
-   Windows: `%LOCALAPPDATA%\codex-with-chatgpt`; config file is
-   `~/.codex/config.toml` on both, or `%USERPROFILE%\.codex\config.toml` on Windows).
-   If already allowlisted, this is a no-op and does not trigger elevation.
+At the start of each workflow, run `c2c update-check --json` without `-w`.
+Do not duplicate sandbox preparation: the workflow's `setup` or `doctor`
+already handles it.
 
 - `{ "updateAvailable": false }` → continue silently. Never mention the check.
 - `{ "updateAvailable": true }` → tell the user one line:
@@ -234,48 +232,45 @@ Inside the checkout directory (see Locations):
 5. Tell the user "✓ 已更新到最新版本" — then resume whatever task triggered this.
    (The updated SKILL.md takes effect from the next Codex session; that's expected.)
 
-## Connection choice (once per installation)
+## Connection profile (installation-wide)
 
-Ask this **before** the public address exists (`c2c setup` / first `doctor --fix`
-that starts a tunnel). Do not mention tunnels, wrangler, DNS, or hostnames.
-Speak only of 临时地址 / 固定域名 / 登录 Cloudflare.
-
-1. `c2c tunnel status -w <workspace> --json` (the choice is stored for the installation)
-2. If `needsChoice` is false: do not ask again. If `provider` is `openai-secure`,
-   use the already configured OpenAI connection and do not ask the Cloudflare question.
-3. If `needsChoice` is true: tell the user exactly `userPrompt` and wait.
-   - 没有账号 / 没有域名 / 临时 / 不用 →
-     `c2c tunnel choose -w <ws> --mode quick --json`
-   - 有域名（例如 example.com）→ first tell them `loginPrompt`, then
-     `c2c tunnel choose -w <ws> --mode named --zone <domain> --json`.
-     This may open the user's own browser (the Cloudflare exception in
-     Golden rule 5). Wait until the command finishes.
-     If they said they have an account but gave no domain: ask once for the
-     domain. If the command returns `need: "zone"`, ask once and retry.
-     If `fallback` is true: tell them `userMessage` and continue on the
-     temporary address. Do not retry named unless they ask.
-4. Never put connection credentials in the project. The CLI stores them in
-   the C2C state directory.
+1. Before first setup, run `c2c connection status --json` without `-w`.
+   Use `connectionMode`, `configured`, and `diagnostic`; do not infer a profile
+   from user-facing text or ask the old Cloudflare preference question.
+2. `secure` is the recommended default. It requires an existing OpenAI Tunnel,
+   `CONTROL_PLANE_TUNNEL_ID`, runtime `CONTROL_PLANE_API_KEY`, and the official
+   `tunnel-client`. Missing prerequisites are errors, not permission to switch.
+   Ask the user to configure secrets locally; never request/paste a key in chat,
+   put it in argv/project files, or use `OPENAI_ADMIN_KEY`.
+3. Only if the user explicitly requests Pairing:
+   - `c2c connection use pairing --json` selects Cloudflare Quick + OAuth.
+   - A requested fixed domain uses `c2c connection use pairing --transport named
+     --zone <domain> --json`; request the domain if missing. Named provisioning
+     can open Cloudflare login. Failure leaves the previous profile unchanged;
+     do not auto-select Quick.
+   - Return to Secure with `c2c connection use secure --json` after validation.
+4. After switching, run `setup` or `start` and update the installation connector
+   if its URL/authentication changes. Register another repository with
+   `c2c workspace add <path> [--alias <alias>]`, or omit the path for cwd.
+   Registration never creates a connector or switches profiles.
+5. Preserve existing explicit `quick`, `named`, or `openai` settings unless the
+   user requests a switch. `pair` generates a code only in Pairing mode, never
+   changes the profile, and requires a running Bridge.
 
 ## Workflow: first-time setup（"使用 Codex with ChatGPT 完成首次配置"）
 
-1. Detect prerequisites yourself: `node --version` (>= 20), and check the selected
-   tunnel binary (`cloudflared`, or official `tunnel-client` when OpenAI runtime
-   credentials are configured).
-   - If cloudflared is missing on macOS run `brew install cloudflared`; on Windows use
-     `winget install Cloudflare.cloudflared`. Do this yourself; don't ask.
+1. Check `node --version` (>= 20) and **Connection profile**. Secure needs the
+   official `tunnel-client` (macOS: `brew install openai/tools/tunnel-client`).
+   Install `cloudflared` only for an explicitly selected Pairing profile.
 2. If the c2c repo has no `node_modules`, run `pnpm install && pnpm build` in it.
-3. Run `c2c sandbox-allow --json`, then **Connection choice**, then
-   `c2c setup -w <workspace> --json`.
-   `sandbox-allow` edits Codex `config.toml` only — it adds C2C's state directory
-   to `[sandbox_workspace_write].writable_roots` so later chats can write logs
-   without elevation. If the write is denied, request approval and retry once.
-   → returns `{ mcpUrl, pairingCode, workspaceName, connectorName, ... }`.
+3. Run `c2c setup -w <workspace> --json`; it prepares the sandbox itself.
+   If the sandbox write is denied, request approval and retry once.
+   → returns `{ connectionMode, connectorAuthentication, pairingRequired,
+   mcpUrl, workspaceId, workspaceName, connectorName, ... }`, never a pairing code.
    `connectorName` is the installation's single connector title. Additional
    registered workspaces reuse it; they do not get a second connector.
-   Pairing codes expire in ~5 minutes. Do not mint one until the ChatGPT
-   Authorize / pairing form is on screen: run `c2c pair --json` then type
-   that code immediately. Doctor does not pre-mint a code.
+   In Pairing mode only, mint a code after the Authorize form is visible with
+   `c2c pair --json`, then type it immediately. Secure never calls `pair`.
 4. `c2c prefs --json` (this machine, not this workspace).
    - If `setupMode` is null: tell the user exactly `setupChoicePrompt`. Wait
      for「1」or「2」. Then `c2c prefs set --setup-mode auto` or `--setup-mode manual`.
@@ -307,11 +302,14 @@ Speak only of 临时地址 / 固定域名 / 登录 Cloudflare.
         installation connector serves them all.
       - Description: `Securely connect ChatGPT to the registered C2C workspaces for planning and review.`
       - Server URL: the `mcpUrl` from step 3
-      - Authentication: OAuth
+      - Secure (`connectorAuthentication: "none"`): Connection = Tunnel;
+        Authentication = No authentication. Never call `pair`.
+      - Pairing (`connectorAuthentication: "oauth-pairing"`): HTTPS MCP URL;
+        Authentication = OAuth.
      Fill the known form in one script when you can. Then Connect / Authorize.
-     Only then run `c2c pair --json` and type that code. As soon as it shows
-     Connected / authorized / pairing accepted, continue — do NOT wait for 8
-     tools on this page.
+     In Pairing mode only, run `c2c pair --json` once the authorization form is
+     visible and type the code. Continue when Connected/authorized; do not wait
+     for a tool-count on this page.
 6. Same tab: open the first C2C chat per **Conversation management**
    (Project collection for a new workspace; `https://chatgpt.com/` only
    in long-chat). Confirm Chat mode per **In-app browser** §7 (if it is Work,
@@ -321,16 +319,15 @@ Speak only of 临时地址 / 固定域名 / 登录 Cloudflare.
    Confirm the reply matches `workspaceName` (wait per **In-app browser** §8).
    Only then save the chat URL with `c2c session set` (see Conversation
    management). If the name does not match, do not save. markDeliverable.
-7. Report to the user exactly in this shape (no internals):
+7. Report the connected profile, workspace, and successful read check in the
+   selected language. English example:
 
 ```
 Codex with ChatGPT
 
-✓ 当前项目已识别
-✓ Workspace Bridge 已启动
-✓ 安全连接已建立
-✓ ChatGPT 已连接
-✓ 文件读取测试通过
+✓ Workspace registered
+✓ Secure Tunnel connected
+✓ ChatGPT workspace read verified
 
 Ready.
 ```
@@ -348,7 +345,7 @@ still loading/generating, or while waiting for login / 2FA / CAPTCHA.
 A chosen manual path does not wait for those two failures.
 
 Stop automating ChatGPT settings. Keep the current local C2C state and the
-current `mcpUrl`, `pairingCode`, `workspaceName`, and `connectorName`. Do not
+current `mcpUrl`, `connectionMode`, `workspaceName`, and `connectorName`. Do not
 silently fall back to Codex-only execution and do not permanently disable C2C.
 Do not change the saved `setupMode` when this is a failure fallback.
 
@@ -372,9 +369,11 @@ next action:
    and create the exact installation `connectorName` with:
    - Description: `Securely connect ChatGPT to the registered C2C workspaces for planning and review.`
    - Server URL: the current `mcpUrl`
-   - Authentication: OAuth
-4. Ask them to Connect / Authorize. Then run `c2c pair --json` and give them
-   only that pairing code. If it expires before they finish, run pair again.
+   - Secure: Connection = Tunnel; Authentication = No authentication.
+   - Pairing: HTTPS MCP URL; Authentication = OAuth.
+4. Ask them to Connect / Authorize. Only in Pairing mode, once the authorization
+   form is open, run `c2c pair --json` and give them that one-time code. If it
+   expires, generate another. Secure Tunnel does not use a pairing code.
 5. When they report Connected / authorized / pairing accepted, resume the normal
    setup/reconnect flow at its ChatGPT verification step. If automatic browser
    verification then hits the same explicit failure twice, stop and report the
@@ -531,12 +530,12 @@ Do not invent `STATE: RESUME`. If the original chat is gone, send HANDOFF.
 All control messages start with `[C2C]`. Keep Codex→ChatGPT messages under 1 KB.
 ChatGPT's replies are expected to be substantive (see step 3). Docs: `docs/protocol.md`.
 
-0. `c2c tunnel status -w <workspace> --json`. If `needsChoice`, follow
-   **Connection choice** first (existing installs: ask once, then remember).
-   Then `c2c doctor -w <workspace> --json` (auto-repairs). **Doctor gate:** if local
+0. `c2c doctor -w <workspace> --json` (auto-repairs and reports `connectionMode`).
+   Do not add a separate tunnel-status round trip or implicitly opt in to Pairing.
+   **Doctor gate:** if local
    is not green, do not open ChatGPT and do not send INIT. If
    `namedRepair.needed` is true, tell the user `namedRepair.userMessage`, run
-   `c2c tunnel login --json` (their browser; Cloudflare exception), then doctor
+   `c2c connection login --json` (their browser; Cloudflare exception), then doctor
    again. If `chatgptRepair.needed` is true, tell the user `chatgptRepair.userMessage`
    (one paragraph, no internals), run **Workflow: reconnect after address
    reclaim**, then doctor again and only continue when the gate is green.
@@ -655,17 +654,22 @@ If status is restricted, ignore it and review from git_diff.
 
 ## Workflow: disconnect（"断开 ChatGPT"）
 
-1. `c2c unpair -w <workspace>` (revokes all tokens immediately).
-2. Optionally remove the connector on the same iab tab via
-   `https://chatgpt.com/plugins` (foreground + markHandoff). Only touch
-   the installation's `connectorName`.
-3. Tell the user: "已断开 ChatGPT 对该项目的访问。"
+1. Read `c2c connection status --json` (installation-wide, no `-w`).
+   Secure: `c2c stop` stops the Bridge and tunnel; permanent upstream access
+   revocation is managed outside C2C. Pairing: `c2c unpair` revokes OAuth access
+   for ALL registered workspaces, not only the current one.
+2. Optionally remove the installation connector on the same iab tab via
+   `https://chatgpt.com/plugins` (foreground + markHandoff).
+3. State the actual installation-wide effect in the selected language. To
+   remove only one workspace, use `workspace disable` or `workspace remove`.
 
 ## Workflow: reconnect after address reclaim（全关掉以后地址失效）
 
-This is the normal case when the user quit Codex / the terminal / the machine:
-the previous public address is gone. Doctor already started a new one.
-`connectorAction: "update"` means Delete + create again — not Reconnect.
+Use this only when doctor reports `chatgptRepair.needed` with a usable new URL.
+Quick Pairing URLs can change after a restart; Secure Tunnel keeps its Tunnel-ID
+URL and normally resumes without recreating the connector. Do not recreate a
+connector just because a terminal closed. `connectorAction: "update"` means
+Delete + create again, not Reconnect.
 
 `c2c doctor --json` will look like:
 `{ "chatgptRepair": { "needed": true, "connectorAction": "update", "connectorName": "...", "userMessage": "...", "mcpUrl": "...", "pages": { ... } } }`
@@ -693,10 +697,11 @@ the previous public address is gone. Doctor already started a new one.
      (do not invent a second name):
       - Description: `Securely connect ChatGPT to the registered C2C workspaces for planning and review.`
       - Server URL: `chatgptRepair.mcpUrl`
-      - Authentication: OAuth
-     Then Connect / Authorize. Only then run `c2c pair --json` and type that
-     code. Continue as soon as it is Connected — do not wait for 8 tools on
-     the settings page.
+      - Secure: Connection = Tunnel; Authentication = No authentication.
+      - Pairing: Authentication = OAuth.
+     Then Connect / Authorize. Only in Pairing mode, once its authorization
+     form is visible, run `c2c pair --json` and type the code. Continue when
+     Connected; do not wait for a tool-count on the settings page.
    - If the name is already gone, skip Delete and only create.
 4. `c2c doctor --json` again. Same tab: only after the Doctor gate is green,
    reopen the chat this Codex thread was already using (`session.url` /
@@ -726,7 +731,7 @@ the previous public address is gone. Doctor already started a new one.
    official `tunnel-client` using the existing tunnel id and runtime key, then
    doctor again. Never use `OPENAI_ADMIN_KEY` or start a second client.
 3. If `namedRepair.needed`, tell the user `namedRepair.userMessage`, run
-   `c2c tunnel login --json`, then doctor again. Do not Delete the connector.
+   `c2c connection login --json`, then doctor again. Do not Delete the connector.
 4. If `chatgptRepair.needed`, follow **reconnect after address reclaim**, then
    doctor again.
 5. Otherwise apply the recovery map. Only involve the user for login / 2FA /
@@ -739,11 +744,11 @@ the previous public address is gone. Doctor already started a new one.
 | Bridge not running | `c2c start` (doctor does this automatically) |
 | Tunnel dead / URL unreachable / 全关掉后连接失效 | `c2c doctor` → if OpenAI is selected, repair the official `tunnel-client` prerequisite/credentials; if `namedRepair.needed`, login to Cloudflare and doctor again (do not Delete). If `chatgptRepair.needed`, tell the user the message, then **Delete** the installation connector only (`connectorName`) and create it again. Never Reconnect. After recreate, re-check `workspace_info` in the saved chat; if it still fails, new chat in the same Project (or long-chat switch) + HANDOFF. |
 | Collection page shows only Retry | Same iab tab: Retry once, then open the last working chat and click its Project link. Do not write INIT/EXECUTED waiting checkpoints until the message is visible. |
-| ChatGPT says tool call failed / 401 | token expired or revoked → re-pair (new pairing code + authorize) |
+| ChatGPT says tool call failed / 401 | Secure: diagnose/restart the official client and its local bearer; never pair or change profiles automatically. Pairing: re-authorize with a fresh pairing code. |
 | Pairing code rejected/expired | `c2c pair --json` for a fresh code |
 | Same explicit ChatGPT setup/reconnect browser configuration step fails twice after repair | Stop automating ChatGPT settings and use **Guided manual ChatGPT setup fallback**. Do not count browser/js timeout, loading/generating, or login/2FA waiting as failures. |
 | Port conflict | handled automatically; never surface to the user |
 | Every new chat “repairs” / cannot write the log or settings directory | `c2c sandbox-allow --json` (once). Do not ask the user. |
-| cloudflared missing | install it yourself (brew/winget), then retry |
+| cloudflared missing | Required only for explicitly selected Pairing. Secure needs tunnel-client instead. |
 | Sidebar has no「项目」 | Ask the user to hover「聊天」, click the …, choose「按项目整理」 |
 | Collection page is the wrong Project | Ask the user to open the named collection and say「已找到」, or accept long-chat |

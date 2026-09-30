@@ -1,5 +1,6 @@
 import path from "node:path";
 import { getStateDir, readJsonIfExists, writeSecureJson } from "./paths.js";
+import { t } from "./language.js";
 
 export const CHATGPT_DEVELOPER_MODE_URL = "https://chatgpt.com/#settings/Security";
 export const CHATGPT_PLUGINS_URL = "https://chatgpt.com/plugins";
@@ -76,5 +77,8 @@ export function connectorNameFor(opts: {
 }
 
 export function reclaimUserMessage(connectorName: string): string {
-  return `当前项目的安全连接地址已经失效。我会删除「${connectorName}」再按新地址加回去，其它项目的连接不动。请稍等。`;
+  return t(
+    `The installation's connection address changed. Replace the ChatGPT connector "${connectorName}" using the new address. This connector serves all registered workspaces.`,
+    `此安裝的連線位址已變更。請使用新位址重新建立 ChatGPT 連接器「${connectorName}」。此連接器供所有已註冊的工作區共用。`
+  );
 }

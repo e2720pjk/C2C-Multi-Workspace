@@ -319,7 +319,9 @@ describe("tunnel preference state", () => {
       askedAt: new Date().toISOString(),
     }));
     expect(readInstallationTunnelState().preference).toBe("unset");
-    expect(selectTunnelProvider(readInstallationTunnelState(), {}).provider).toBe("cloudflare-quick");
+    expect(selectTunnelProvider(readInstallationTunnelState(), {})).toMatchObject({
+      provider: "openai-secure", diagnostic: expect.stringContaining("CONTROL_PLANE_TUNNEL_ID"),
+    });
     writeTunnelState({
       workspaceId: "installation",
       preference: "named",
@@ -331,19 +333,19 @@ describe("tunnel preference state", () => {
     expect(selectTunnelProvider(readInstallationTunnelState(), env).provider).toBe("cloudflare-named");
   });
 
-  it("does not auto-select OpenAI for incomplete runtime configuration", () => {
+  it("never falls back to Pairing for incomplete Secure runtime configuration", () => {
     const state = { workspaceId: "installation", preference: "unset" as const };
     expect(selectTunnelProvider(state, { CONTROL_PLANE_TUNNEL_ID: "tunnel_0123456789abcdef0123456789abcdef" })).toEqual({
-      provider: "cloudflare-quick",
+      provider: "openai-secure",
       diagnostic: expect.stringContaining("CONTROL_PLANE_API_KEY"),
     });
     expect(openAiRuntimeConfiguration({ CONTROL_PLANE_API_KEY: "runtime-secret" }).complete).toBe(false);
   });
 
-  it("asks once, then remembers a quick choice", () => {
+  it("defaults to Secure without a question, then remembers an explicit quick choice", () => {
     stateDirs.push(isolateStateDir());
     const unset = readTunnelState("ws1");
-    expect(needsTunnelChoice(unset)).toBe(true);
+    expect(needsTunnelChoice(unset)).toBe(false);
     const saved = chooseQuickTunnel("ws1");
     expect(saved.preference).toBe("quick");
     expect(needsTunnelChoice(readTunnelState("ws1"))).toBe(false);
@@ -392,7 +394,7 @@ describe("tunnel preference state", () => {
     }).then((result) => {
       expect(result.fallback).toBe(true);
       expect(result.state.preference).toBe("quick");
-      expect(result.userMessage).toMatch(/临时地址/);
+      expect(result.userMessage).toMatch(/temporary address/);
     });
   });
 

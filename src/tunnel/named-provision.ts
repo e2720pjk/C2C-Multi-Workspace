@@ -6,7 +6,7 @@ import { findBinary } from "./detect.js";
 import { suggestedNamedHostname } from "./hostname.js";
 import { normalizeNamedTunnelHostname } from "./cloudflared-named.js";
 import {
-  NAMED_FALLBACK_MESSAGE,
+  namedFallbackMessage,
   writeTunnelState,
   type TunnelState,
 } from "./state.js";
@@ -251,7 +251,7 @@ function fallbackState(workspaceId: string, reason: string, error: string, persi
     ok: true,
     state: persist ? writeTunnelState(state) : state,
     fallback: true,
-    userMessage: NAMED_FALLBACK_MESSAGE,
+    userMessage: namedFallbackMessage(),
     error,
   };
 }

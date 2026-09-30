@@ -46,7 +46,7 @@ function tunnelForInstallation(
   // must not inherit the user's installation provider choice.
   const state = usePersistedState
     ? readInstallationTunnelState()
-    : { workspaceId: INSTALLATION_WORKSPACE_ID, preference: "unset" as const };
+    : { workspaceId: INSTALLATION_WORKSPACE_ID, preference: "quick" as const };
   const selection = selectTunnelProvider(state, usePersistedState ? process.env : {});
   if (selection.provider === "openai-secure") {
     return new OpenAiSecureTunnel({
@@ -209,8 +209,6 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
     const hostHeader = req.get("host") ?? `${host}:${port}`;
     return `${proto}://${hostHeader}`;
   };
-  const pathQualifiedPublicUrl = (): boolean => tunnel.name === "openai-secure" && publicBaseUrl !== null;
-
   const registrySnapshot = (): { workspaceId: string; workspaceIds: string[]; defaultWorkspaceId: string | null } => {
     const current = registry.list();
     const defaultId = registry.defaultWorkspaceId();
@@ -238,18 +236,19 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
     });
   });
 
-  // ---- OAuth + discovery -------------------------------------------------
+  // ---- OAuth + discovery (explicit Pairing mode only) --------------------
 
-  app.use(
-    createOAuthRouter({
-      store: authStore,
-      pairing,
-      workspaceName: legacySingle ? workspace.name : "C2C installation",
-      getBaseUrl,
-      getResourceUrl: (_req, base) => (pathQualifiedPublicUrl() ? base : `${base}/mcp`),
-      logger,
-    })
-  );
+  if (tunnel.name !== "openai-secure") {
+    app.use(
+      createOAuthRouter({
+        store: authStore,
+        pairing,
+        workspaceName: legacySingle ? workspace.name : "C2C installation",
+        getBaseUrl,
+        logger,
+      })
+    );
+  }
 
   // ---- MCP endpoint (bearer-protected) -----------------------------------
 
@@ -269,6 +268,7 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
       store: authStore,
       // Multi-workspace tokens authorize the installation, not one target.
       workspaceId: legacySingle ? workspace.id : undefined,
+      clientId: tunnel.name === "openai-secure" ? "c2c-openai-tunnel" : undefined,
       getBaseUrl,
       logger,
     }),
@@ -293,6 +293,10 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
   };
 
   app.post("/admin/pairing", adminGuard, (_req, res) => {
+    if (tunnel.name === "openai-secure") {
+      res.status(409).json({ error: "PAIRING_DISABLED", message: "Switch explicitly with c2c connection use pairing before requesting a code." });
+      return;
+    }
     const session = pairing.create();
     logger.info("Created pairing session");
     res.json({ code: session.code, expiresAt: session.expiresAt });

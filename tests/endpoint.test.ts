@@ -19,7 +19,8 @@ describe("connectorAction", () => {
 
   it("updates when the old address was reclaimed", () => {
     expect(connectorAction("https://old.trycloudflare.com/mcp", "https://new.trycloudflare.com/mcp")).toBe("update");
-    expect(reclaimUserMessage("Codex with ChatGPT")).toContain("删除");
+    expect(reclaimUserMessage("Codex with ChatGPT")).toContain("Replace the ChatGPT connector");
+    expect(reclaimUserMessage("Codex with ChatGPT")).toContain("all registered workspaces");
     expect(reclaimUserMessage("Codex with ChatGPT")).not.toContain("Reconnect");
   });
 

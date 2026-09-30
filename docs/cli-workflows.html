@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>C2C · CLI workflows</title>
+  <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; }
+    :root {
+      --paper: #f5f5f5; --paper-2: #ececec; --ink: #2d3142;
+      --muted: #4f5d75; --soft: #7a8399; --rule: rgba(45,49,66,.12);
+      --accent: #eb6c36; --accent-tint: rgba(235,108,54,.08);
+      --sans: 'Geist', system-ui, sans-serif;
+      --serif: 'Instrument Serif', Georgia, serif;
+      --mono: 'Geist Mono', ui-monospace, monospace;
+    }
+    body { margin: 0; padding: 48px 24px; background: var(--paper); color: var(--ink); font: 16px/1.6 var(--sans); }
+    main { max-width: 1280px; margin: auto; }
+    .eyebrow { color: var(--muted); font: 11px var(--mono); letter-spacing: .18em; text-transform: uppercase; }
+    h1 { margin: 12px 0; font: 400 clamp(32px, 4vw, 48px)/1.15 var(--serif); }
+    h2 { margin: 0; font-size: 21px; font-weight: 500; }
+    p { margin: 12px 0; max-width: 84ch; }
+    .intro { color: var(--muted); }
+    section { margin-top: 40px; }
+    .diagram-container { width: 100%; overflow-x: auto; border: 1px solid var(--rule); border-radius: 6px; }
+    .diagram-container:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px; }
+    svg { display: block; width: 100%; min-width: 1280px; font-family: var(--sans); }
+    .lane { font: 500 12px var(--mono); letter-spacing: .1em; fill: var(--muted); }
+    .node { fill: var(--paper); stroke: var(--ink); stroke-width: 1; }
+    .external { stroke-dasharray: 5 4; }
+    .focal { fill: var(--accent-tint); stroke: var(--accent); stroke-width: 1.4; }
+    .name { font-size: 18px; font-weight: 600; fill: var(--ink); }
+    .code { font: 16px var(--mono); fill: var(--ink); }
+    .sub { font-size: 14px; fill: var(--muted); }
+    .legend { font-size: 13px; fill: var(--muted); }
+    .edge { fill: none; stroke: var(--muted); stroke-width: 1.4; }
+    .rule { stroke: var(--rule); stroke-width: 1; }
+    .grid { display: grid; grid-template-columns: 1.1fr .9fr; gap: 32px; }
+    pre { font: 14px/1.8 var(--mono); overflow-x: auto; padding: 20px; background: var(--paper-2); border-radius: 6px; }
+    code { font-family: var(--mono); font-size: .9em; }
+    ul { padding-left: 22px; }
+    footer { border-top: 1px solid var(--rule); margin-top: 40px; padding-top: 16px; color: var(--muted); font-size: 14px; }
+    a { color: var(--muted); text-underline-offset: 3px; }
+    @media (max-width: 760px) { body { padding: 24px 16px; } .grid { grid-template-columns: 1fr; gap: 12px; } }
+    @media print {
+      body { padding: 0; background: white; }
+      section { break-inside: avoid; }
+      .diagram-container { overflow-x: visible; }
+      svg { min-width: 0; }
+      .grid { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <div class="eyebrow">C2C / CLI design / Swimlane</div>
+    <h1>Two explicit connection profiles.</h1>
+    <p class="intro">One installation, one read-only MCP endpoint, many registered workspaces. The CLI owns connection setup and diagnostics; ChatGPT plans and reviews, while the coding agent edits and executes.</p>
+  </header>
+
+  <section aria-labelledby="secure-heading">
+    <h2 id="secure-heading">01 · Secure Tunnel — the default</h2>
+    <p>Prepare an existing OpenAI Tunnel ID, Runtime API Key, and official <code>tunnel-client</code>. Missing prerequisites are an error, never an automatic switch to Pairing.</p>
+    <div class="diagram-container" tabindex="0" role="region" aria-label="Secure workflow, horizontally scrollable on small screens">
+      <svg viewBox="0 0 1280 480" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="c2c-secure-title c2c-secure-desc">
+        <title id="c2c-secure-title">Default Secure Tunnel setup</title>
+        <desc id="c2c-secure-desc">Run c2c setup to register the current directory and start Secure Tunnel. Copy its MCP URL into a ChatGPT connector using Connection Tunnel and No authentication, then verify workspace_info. No OAuth or pairing code is used.</desc>
+        <defs><marker id="secure-arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#4f5d75"/></marker></defs>
+        <rect width="1280" height="480" fill="#f5f5f5"/>
+        <line class="rule" x1="32" y1="216" x2="1248" y2="216"/>
+        <line class="rule" x1="32" y1="400" x2="1248" y2="400"/>
+        <text class="lane" x="32" y="140">CLI</text>
+        <text class="lane" x="32" y="304">CHATGPT</text>
+        <!-- Connectors precede nodes; the elbow carries the MCP URL handoff. -->
+        <path class="edge" d="M456 136 H640 Q648 136 648 144 V248" marker-end="url(#secure-arrow)"/>
+        <path class="edge" d="M800 300 H896" marker-end="url(#secure-arrow)"/>
+        <rect class="node focal" x="160" y="96" width="296" height="80" rx="6"/>
+        <text class="code" x="184" y="128">c2c setup</text>
+        <text class="sub" x="184" y="152">Register cwd; start bridge + tunnel</text>
+        <rect class="node external" x="504" y="248" width="296" height="104" rx="6"/>
+        <text class="name" x="528" y="280">Create one connector</text>
+        <text class="sub" x="528" y="308">Connection = Tunnel</text>
+        <text class="sub" x="528" y="332">Authentication = No authentication</text>
+        <rect class="node external" x="896" y="248" width="320" height="104" rx="6"/>
+        <text class="name" x="920" y="280">Verify read access</text>
+        <text class="code" x="920" y="308">workspace_info</text>
+        <text class="sub" x="920" y="332">Select a registered workspace</text>
+        <rect class="node" x="32" y="432" width="20" height="12" rx="2"/>
+        <text class="legend" x="64" y="444">CLI step</text>
+        <rect class="node external" x="200" y="432" width="20" height="12" rx="2"/>
+        <text class="legend" x="232" y="444">ChatGPT action</text>
+        <text class="legend" x="448" y="444">No pairing code. Local MCP still requires the process-bound bearer.</text>
+      </svg>
+    </div>
+    <p>Later: <code>c2c start</code> resumes the selected connection; <code>c2c doctor</code> checks and repairs it. Use <code>--no-tunnel</code> only for a local development bridge.</p>
+  </section>
+
+  <section aria-labelledby="pairing-heading">
+    <h2 id="pairing-heading">02 · Pairing — explicit opt-in</h2>
+    <p>This profile uses Cloudflare Quick or Named transport plus OAuth. Install <code>cloudflared</code> first. Choosing Pairing is separate from generating a one-time code.</p>
+    <div class="diagram-container" tabindex="0" role="region" aria-label="Pairing workflow, horizontally scrollable on small screens">
+      <svg viewBox="0 0 1280 480" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="c2c-pairing-title c2c-pairing-desc">
+        <title id="c2c-pairing-title">Explicit Pairing setup and browser handoff</title>
+        <desc id="c2c-pairing-desc">Explicitly select Pairing, then run setup. Create the ChatGPT connector with OAuth. Only after its authorization form opens, run c2c pair and enter the code in that form. Setup and doctor never generate codes.</desc>
+        <defs><marker id="pairing-arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#4f5d75"/></marker></defs>
+        <rect width="1280" height="480" fill="#f5f5f5"/>
+        <line class="rule" x1="32" y1="216" x2="1248" y2="216"/>
+        <line class="rule" x1="32" y1="400" x2="1248" y2="400"/>
+        <text class="lane" x="32" y="140">CLI</text>
+        <text class="lane" x="32" y="304">CHATGPT</text>
+        <path class="edge" d="M456 136 H504" marker-end="url(#pairing-arrow)"/>
+        <path class="edge" d="M608 176 V248" marker-end="url(#pairing-arrow)"/>
+        <path class="edge" d="M800 300 H1048 Q1056 300 1056 292 V176" marker-end="url(#pairing-arrow)"/>
+        <path class="edge" d="M992 176 V192 Q992 200 984 200 H728 Q720 200 720 208 V248" marker-end="url(#pairing-arrow)"/>
+        <rect x="824" y="208" width="128" height="20" fill="#f5f5f5"/>
+        <text class="legend" x="832" y="222">Enter the code</text>
+        <rect x="1080" y="220" width="164" height="24" fill="#f5f5f5"/>
+        <text class="legend" x="1088" y="236">Only once form is open</text>
+        <rect class="node" x="160" y="96" width="296" height="80" rx="6"/>
+        <text class="code" x="180" y="128">c2c connection use pairing</text>
+        <text class="sub" x="180" y="152">Quick; or explicitly request Named</text>
+        <rect class="node" x="504" y="96" width="296" height="80" rx="6"/>
+        <text class="code" x="528" y="128">c2c setup</text>
+        <text class="sub" x="528" y="152">Print MCP URL; do not mint a code</text>
+        <rect class="node" x="896" y="96" width="320" height="80" rx="6"/>
+        <text class="code" x="920" y="128">c2c pair</text>
+        <text class="sub" x="920" y="152">One-time code; expires in 5 minutes</text>
+        <rect class="node external" x="504" y="248" width="296" height="104" rx="6"/>
+        <text class="name" x="528" y="280">Create the connector</text>
+        <text class="sub" x="528" y="308">Authentication = OAuth</text>
+        <text class="sub" x="528" y="332">Open its authorization form</text>
+        <rect class="node" x="32" y="432" width="20" height="12" rx="2"/>
+        <text class="legend" x="64" y="444">CLI step</text>
+        <rect class="node external" x="200" y="432" width="20" height="12" rx="2"/>
+        <text class="legend" x="232" y="444">ChatGPT action</text>
+        <text class="legend" x="448" y="444">Finish authorization, then verify workspace_info in ChatGPT.</text>
+      </svg>
+    </div>
+  </section>
+
+  <section class="grid" aria-label="Workspace and language operations">
+    <div>
+      <h2>Register once; reuse the connector.</h2>
+      <pre>c2c workspace add
+c2c workspace add /repo/worktree --alias review
+c2c workspace set-default review
+c2c workspace list</pre>
+      <p>The path is positional and defaults to cwd. Mutation targets are workspace aliases/IDs. The legacy <code>-w</code> add spelling remains accepted, but cannot be combined with a positional path.</p>
+    </div>
+    <div>
+      <h2>English by default.</h2>
+      <pre>c2c prefs set --language en
+c2c prefs set --language zh-TW
+c2c connection status --json
+c2c doctor --json</pre>
+      <p>Language and connection preferences belong to the installation. JSON keys and error codes remain stable; user data and third-party diagnostics are not translated.</p>
+    </div>
+  </section>
+  <section aria-label="Scope and compatibility">
+    <h2>Scopes that no longer look interchangeable.</h2>
+    <ul>
+      <li><code>start</code>, <code>setup</code>, <code>doctor</code> and workspace-specific reads accept <code>-w</code> for a local root.</li>
+      <li><code>connection</code>, <code>stop</code>, <code>pair</code>, <code>unpair</code>, <code>logs</code> and <code>prefs</code> are installation-wide. Compatibility <code>-w</code> flags are hidden and ignored.</li>
+      <li><code>unpair</code> revokes Pairing OAuth access for every registered workspace. It is not a Secure Tunnel switch or a single-project disconnect.</li>
+      <li>Switch with <code>connection use secure|pairing</code>, then run <code>setup</code> or <code>start</code>. Failed validation leaves the previous connection profile unchanged.</li>
+    </ul>
+  </section>
+  <footer>Implementation sources: <a href="../src/cli/index.ts">CLI</a>, <a href="../src/tunnel/state.ts">profile selection</a>, <a href="../src/bridge/server.ts">authorization boundary</a>. See <a href="../README.md">README</a> for installation and runtime prerequisites.</footer>
+</main>
+</body>
+</html>

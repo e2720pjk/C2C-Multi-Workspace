@@ -9,14 +9,17 @@ workspace does not change the Connector or restart the tunnel.
 ## Manage the local allowlist
 
 ```bash
-c2c workspace add --workspace /path/to/main --alias main
-c2c workspace add --workspace /path/to/gemini-refactor --alias gemini-refactor
+c2c workspace add /path/to/main --alias main
+c2c workspace add /path/to/gemini-refactor --alias gemini-refactor
 c2c workspace list --json
 c2c workspace set-default main
 c2c workspace disable gemini-refactor
 c2c workspace enable gemini-refactor
 c2c workspace remove gemini-refactor
 ```
+
+`workspace add` without a path registers cwd; the old `-w <path>` spelling is
+accepted but cannot be combined with a positional path.
 
 `workspace list` exposes the stable id, alias, display name, branch/basic
 project metadata, availability, enabled state, and default state. It does not
@@ -72,9 +75,10 @@ never accepts a filesystem root supplied by the model.
 
 The registry, installation OAuth state, runtime/admin state, and tunnel
 runtime belong to the C2C installation. Git state, execution records, and
-filesystem contents remain keyed by the selected workspace id. OAuth tokens
+filesystem contents remain keyed by the selected workspace id. Pairing OAuth tokens (or Secure Tunnel's process-bound local bearer)
 authorize the installation endpoint; the `workspace` argument only selects
-one member of its pre-registered allowlist.
+one member of its pre-registered allowlist. Secure mode disables OAuth registration
+and pairing, and refuses legacy OAuth credentials.
 
 ## Installation lifecycle
 
@@ -100,7 +104,8 @@ because the preferred port is occupied.
 `status`, `stop`, and `restart` distinguish `healthy`, `stopped`, and
 `unknown/conflicting`. Corrupt state, a failed health probe, an unverifiable
 PID, or a contract mismatch is reported and fails closed. A same-contract older
-build remains manageable and `start` reuses it; an explicit `restart` replaces
+build remains manageable and local-only `start --no-tunnel` can reuse it;
+public startup requires the current build and selected profile. An explicit `restart` replaces
 it only after owner-lease, process-identity, health, and authenticated-admin
 proof. Lifecycle code does not kill a PID it cannot attribute to this
 installation.
@@ -116,7 +121,7 @@ workspace does not create another Connector. The one tunnel provider is owned
 by the bridge process and forwards to the same local MCP port. Requests for A
 and B can run concurrently, and no routing path calls tunnel start/restart.
 
-Tunnel and endpoint state is installation-owned; obsolete per-workspace tunnel state is not read. This checkout also supports the official OpenAI Secure Tunnel client when
+Tunnel and endpoint state is installation-owned; obsolete per-workspace tunnel state is not read. Unconfigured installations default to the official OpenAI Secure Tunnel; an existing explicit Cloudflare Quick/Named preference is retained. Secure requires
 `CONTROL_PLANE_TUNNEL_ID` and `CONTROL_PLANE_API_KEY` are set. C2C starts one
 installation-owned `tunnel-client` process and uses the connector URL
 `<CONTROL_PLANE_BASE_URL>/v1/mcp/<tunnel_id>` (default base:

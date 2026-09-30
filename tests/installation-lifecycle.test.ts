@@ -43,7 +43,7 @@ function runOfficialCli(args: string[], state: string): Promise<{ code: number |
 }
 
 function runCliStart(root: string, state: string): Promise<{ code: number | null; stdout: string; stderr: string }> {
-  return runCli(["start", "--workspace", root, "--json"], state);
+  return runCli(["start", "--workspace", root, "--no-tunnel", "--json"], state);
 }
 
 function baseRuntime(root: string) {
@@ -96,7 +96,7 @@ describe("installation lifecycle ownership", () => {
     write(root, "a.txt", "a");
 
     try {
-      const started = await runOfficialCli(["start", "--workspace", root, "--json"], state);
+      const started = await runOfficialCli(["start", "--workspace", root, "--no-tunnel", "--json"], state);
       expect(started.code, started.stderr).toBe(0);
 
       const before = await runOfficialCli(["status", "--workspace", root, "--json"], state);
@@ -110,12 +110,13 @@ describe("installation lifecycle ownership", () => {
       });
       expect(mcpBefore.status).toBe(401);
       const doctor = await runOfficialCli(["doctor", "--workspace", root, "--no-fix", "--json"], state);
-      expect(doctor.code, doctor.stderr).toBe(0);
+      // A local-only development bridge is reachable, but not ready for ChatGPT.
+      expect(doctor.code, doctor.stderr).toBe(1);
       expect(JSON.parse(doctor.stdout.trim())).toMatchObject({
         report: { bridge: { ok: true }, mcp: { ok: true } },
       });
 
-      const restarted = await runOfficialCli(["restart", "--workspace", root], state);
+      const restarted = await runOfficialCli(["restart", "--workspace", root, "--no-tunnel"], state);
       expect(restarted.code, restarted.stderr).toBe(0);
       const after = await runOfficialCli(["status", "--workspace", root, "--json"], state);
       expect(after.code, after.stderr).toBe(0);
@@ -181,15 +182,15 @@ describe("installation lifecycle ownership", () => {
       expect(before.code, before.stderr).toBe(0);
       expect(JSON.parse(before.stdout.trim())).toMatchObject({ running: true, compatible: true, pid: process.pid });
 
-      const reused = await runOfficialCli(["start", "--workspace", root, "--json"], state);
+      const reused = await runOfficialCli(["start", "--workspace", root, "--no-tunnel", "--json"], state);
       expect(reused.code, reused.stderr).toBe(0);
       const afterStart = await runOfficialCli(["status", "--workspace", root, "--json"], state);
       expect(JSON.parse(afterStart.stdout.trim())).toMatchObject({ running: true, pid: process.pid });
       const doctor = await runOfficialCli(["doctor", "--workspace", root, "--no-fix", "--json"], state);
-      expect(doctor.code, doctor.stderr).toBe(0);
+      expect(doctor.code, doctor.stderr).toBe(1);
       expect(JSON.parse(doctor.stdout.trim())).toMatchObject({ report: { bridge: { ok: true }, mcp: { ok: true } } });
 
-      const restarted = await runOfficialCli(["restart", "--workspace", root], state);
+      const restarted = await runOfficialCli(["restart", "--workspace", root, "--no-tunnel"], state);
       expect(restarted.code, restarted.stderr).toBe(0);
       const status = await runOfficialCli(["status", "--workspace", root, "--json"], state);
       expect(status.code, status.stderr).toBe(0);
@@ -199,6 +200,50 @@ describe("installation lifecycle ownership", () => {
     } finally {
       await stopBridge();
       await old.close();
+    }
+  });
+
+  it("refuses public startup and repair through a mismatched or older bridge", async () => {
+    for (const [provider, build, error] of [
+      ["cloudflare-quick", RUNTIME_BUILD_ID, "CONNECTION_PROFILE_MISMATCH"],
+      ["openai-secure", "older-build", "BRIDGE_UPDATE_REQUIRED"],
+    ]) {
+      const state = isolateStateDir();
+      const root = makeTmpDir("lifecycle-profile-guard");
+      dirs.push(state, root);
+      let starts = 0;
+      const bridge = await startBridge({
+        workspaceRoot: root, port: 0, persistRuntime: true,
+        runtimeBuildId: build, exitOnShutdown: false,
+        tunnelProvider: {
+          name: provider,
+          start: async () => { starts += 1; return null; },
+          restart: async () => { starts += 1; return null; },
+          stop: async () => {},
+          status: () => ({ running: false, url: null, provider }),
+          getPublicUrl: () => null,
+          doctor: async () => ({ provider, running: false, url: null, binaryFound: true, binaryPath: null, problems: [] }),
+        },
+      });
+      const env = {
+        CONTROL_PLANE_TUNNEL_ID: "tunnel_0123456789abcdef0123456789abcdef",
+        CONTROL_PLANE_API_KEY: "runtime-secret",
+        C2C_TUNNEL_CLIENT_PATH: process.execPath,
+      };
+      try {
+        const connection = await runCli(["connection", "status", "--json"], state, env);
+        expect(JSON.parse(connection.stdout)).toMatchObject({ provider: "openai-secure", liveProvider: provider });
+        const started = await runCli(["start", "-w", root, "--json"], state, env);
+        expect(started.code).toBe(1);
+        expect(JSON.parse(started.stdout).error).toContain(error);
+        const doctor = await runCli(["doctor", "-w", root, "--no-fix", "--json"], state, env);
+        expect(doctor.code).toBe(1);
+        expect(JSON.parse(doctor.stdout).report.tunnel.detail).toContain(error);
+        expect(starts).toBe(0);
+        expect((await findInstallationObservation()).state).toBe("healthy");
+      } finally {
+        await bridge.close();
+      }
     }
   });
 

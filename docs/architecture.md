@@ -31,6 +31,7 @@
 
 ## Principles
 
+- **CLI first.** `c2c` is the primary interface; the Skill is an optional caller.
 - **ChatGPT thinks. Codex works.** The bridge never re-implements a coding harness.
 - **Computer Use = control plane**: tiny `[C2C]` state messages (< 1 KB).
 - **MCP = data plane**: ChatGPT pulls files/diffs/search results itself.
@@ -43,13 +44,13 @@
 | --- | --- |
 | `bridge/` | Express app assembly, loopback-only listener, port fallback, runtime state, admin API |
 | `mcp/` | McpServer with workspace-aware read-only tools plus installation discovery; stateless Streamable HTTP transport (fresh server per request, JSON responses) |
-| `auth/` | OAuth 2.1 authorization server: discovery metadata (RFC 8414 + Protected Resource Metadata), dynamic client registration (RFC 7591), authorization-code + PKCE (S256 only), refresh rotation, revocation (RFC 7009). Opaque tokens stored as SHA-256 hashes |
+| `auth/` | Secure process-bearer verification; Pairing-only OAuth 2.1 authorization server: discovery metadata (RFC 8414 + Protected Resource Metadata), dynamic client registration (RFC 7591), authorization-code + PKCE (S256 only), refresh rotation, revocation (RFC 7009). Opaque tokens stored as SHA-256 hashes |
 | `pairing/` | PairingCode lifecycle: CSPRNG generation, TTL, attempt limits, IP rate limit, one-time use |
 | `workspace/` | Canonical-path containment, sensitive-file policy, `.c2cignore`, paginated read/list, search/git, and the installation workspace registry |
 | `tunnel/` | Installation-owned `TunnelProvider` interface + Cloudflare Quick/Named and official OpenAI `tunnel-client` integration; one canonical installation tunnel state |
 | `execution/` | JSONL execution records plus optional sanitized command output (`execution_output`) |
 | `process/` | Daemon spawn/reuse, health probing, graceful shutdown |
-| `cli/` | `c2c` commands; `--json` everywhere for the Skill |
+| `cli/` | `c2c` management commands, stable JSON status, connection profiles, positional workspace registration, localized help/output |
 | `config/`, `logger/` | OS-convention state dir, secret-redacting logger |
 
 ## Request lifecycles
@@ -60,7 +61,11 @@ middleware → stateless StreamableHTTP transport → tool handler (including
 (path containment → ignore rules → pagination) → JSON result. No mutable current
 workspace is changed by a request.
 
-**Authorization**: 401 with `WWW-Authenticate: resource_metadata=…` →
+**Secure authorization**: ChatGPT → OpenAI Tunnel → installation-owned
+`tunnel-client` → process-bound bearer on local `/mcp`. OAuth and pairing routes
+are disabled, and legacy OAuth tokens cannot authenticate in this profile.
+
+**Pairing authorization**: 401 with `WWW-Authenticate: resource_metadata=…` →
 `/.well-known/oauth-protected-resource/mcp` → AS metadata → DCR →
 `/oauth/authorize` (HTML pairing page) → pairing code verified → 302 with
 authorization code → `/oauth/token` (PKCE S256) → access + refresh tokens.
@@ -78,11 +83,24 @@ ports. Registering another root updates the allowlist without starting a second
 daemon or tunnel. Provider changes validate the candidate first, then serialize
 stop-and-state-update in this same installation startup critical section.
 
-**Tunnel**: default is a Cloudflare Quick Tunnel (`cloudflared tunnel --url …`); an installation may instead use the official OpenAI `tunnel-client` with an existing Tunnel ID and runtime `CONTROL_PLANE_API_KEY`. The child receives no `OPENAI_ADMIN_KEY`, and the tunnel-client owner lock plus daemon owner lock prevent two clients sharing one tunnel id/channel.
-The Quick Tunnel URL changes per start, so `c2c doctor` can restart it and tell the Skill to
-Delete + recreate the installation's ChatGPT connector; an OpenAI tunnel uses its
-stable tunnel-id URL. The workspace target never changes that connector. The Skill asks before the first public URL exists;
-`cloudflared tunnel login` is the only extra user step. Tunnel name, hostname and preference live in one installation-owned record under the OS state dir, never in the project. Obsolete per-workspace tunnel records are not read. Named starts use `cloudflared tunnel --url … run <name>` so the public
-URL stays stable. If named provisioning fails, C2C falls back to Quick Tunnel.
-If a named tunnel later drops, doctor asks for a Cloudflare re-login
-(`namedRepair`) instead of rotating the one installation connector.
+**Connection profiles**: unconfigured installations default to OpenAI Secure
+Tunnel with an existing Tunnel ID, runtime `CONTROL_PLANE_API_KEY`, and official
+`tunnel-client`. Missing configuration fails closed, never falls back to Pairing.
+Explicit persisted `quick`, `named`, and `openai` choices remain supported.
+`c2c connection use secure|pairing` changes the installation-wide profile; Pairing
+uses Cloudflare Quick/Named transport plus OAuth. A failed named candidate leaves
+the current profile unchanged. Setup never creates a pairing code; `c2c pair`
+requires Pairing mode and a running Bridge.
+
+The child receives no `OPENAI_ADMIN_KEY`; tunnel-client and daemon owner locks
+prevent overlapping clients. Secure uses a stable Tunnel-ID URL. Quick Pairing
+URLs can change, so doctor reports when the installation connector must be
+replaced. Named transport keeps a fixed hostname and uses `namedRepair` for
+Cloudflare login. Workspace selection never changes a connector or tunnel.
+Public startup/repair refuses a mismatched provider or older Bridge build until
+an explicit restart. Preferences and tunnel metadata live in the OS state dir,
+never the project; obsolete per-workspace tunnel records are not read.
+
+**Language**: installation preferences default to English independently of OS
+locale. `prefs set --language en|zh-TW` localizes CLI help/prompts and Pairing HTML.
+JSON field names, option names, protocol enums, and error codes remain stable.

@@ -7,6 +7,8 @@ export interface BearerAuthDeps {
   store: AuthStore;
   /** Legacy single-workspace audience check. Omit for installation tokens. */
   workspaceId?: string;
+  /** Secure Tunnel accepts only its process-bound local credential, not legacy OAuth tokens. */
+  clientId?: string;
   getBaseUrl: (req: Request) => string;
   logger: Logger;
 }
@@ -20,8 +22,8 @@ export interface BearerAuthDeps {
 export function bearerAuth(deps: BearerAuthDeps) {
   return (req: Request, res: Response, next: NextFunction): void => {
     const challenge = (error: string, description: string): string =>
-      `Bearer realm="c2c", error="${error}", error_description="${description}", ` +
-      `resource_metadata="${deps.getBaseUrl(req)}/.well-known/oauth-protected-resource/mcp"`;
+      `Bearer realm="c2c", error="${error}", error_description="${description}"` +
+      (deps.clientId ? "" : `, resource_metadata="${deps.getBaseUrl(req)}/.well-known/oauth-protected-resource/mcp"`);
 
     const header = req.headers.authorization;
     if (!header || !header.toLowerCase().startsWith("bearer ")) {
@@ -39,6 +41,10 @@ export function bearerAuth(deps: BearerAuthDeps) {
         .status(401)
         .set("WWW-Authenticate", challenge("invalid_token", `Token ${verdict.reason}`))
         .json({ error: "unauthorized", error_description: `Token ${verdict.reason}` });
+      return;
+    }
+    if (deps.clientId !== undefined && (verdict.record.clientId !== deps.clientId || verdict.record.kind !== "internal")) {
+      res.status(403).json({ error: "forbidden", error_description: "This token is not authorized for the selected connection mode" });
       return;
     }
     if (deps.workspaceId !== undefined && verdict.record.workspaceId !== deps.workspaceId) {

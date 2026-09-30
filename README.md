@@ -1,6 +1,6 @@
 # C2C Multi-Workspace
 
-C2C lets ChatGPT reach local development files through a loopback Bridge and an MCP endpoint.
+C2C is a CLI for connecting ChatGPT to registered local workspaces through a read-only MCP Bridge. ChatGPT plans and reviews; your coding agent retains editing, shell, git, and test execution.
 
 This fork extends the usual one-project setup: **one C2C installation and one Connector can manage many registered repositories or worktrees**. Workspace selection happens per request, so changing repositories does not require rebuilding the Connector or restarting the tunnel.
 
@@ -14,7 +14,9 @@ The extension adds:
 - request-scoped workspace ids and aliases, with `list_workspaces` discovery;
 - no Connector or tunnel restart when registering or selecting a workspace;
 - installation ownership checks for builds, PIDs, stale locks, and orphan tunnel clients;
-- optional support for an existing official OpenAI Secure Tunnel.
+- OpenAI Secure Tunnel as the recommended default for a persistent ChatGPT connection;
+- explicit opt-in to the older Cloudflare + OAuth Pairing profile;
+- English CLI output by default, with an explicit Traditional Chinese setting.
 
 The implementation is aimed at personal and experimental workflows. See [`docs/`](docs/) for protocol, security, and architecture details.
 
@@ -42,29 +44,20 @@ Verify the CLI:
 c2c --help
 ```
 
-### 3. Install a tunnel dependency (optional for local-only use)
+### 3. Prepare Secure Tunnel (recommended)
 
-On macOS, choose one of these short paths:
-
-**Cloudflare Quick or Named Tunnel**
-
-```bash
-brew install cloudflared
-cloudflared --version
-```
-
-See the [official Cloudflare `cloudflared` installation documentation](https://developers.cloudflare.com/tunnel/downloads/). Named tunnels also need a Cloudflare account and a domain already in Cloudflare.
-
-**OpenAI Secure Tunnel**
+On macOS:
 
 ```bash
 brew install openai/tools/tunnel-client
 tunnel-client --version
+export CONTROL_PLANE_TUNNEL_ID=tunnel_...
+export CONTROL_PLANE_API_KEY=...
 ```
 
-See the [official OpenAI `tunnel-client` repository](https://github.com/openai/tunnel-client). This installs the official client; C2C still needs an existing Tunnel ID and Runtime API Key.
+Obtain an existing Tunnel ID and Runtime API Key outside C2C. C2C runs the official client but does not create/delete Tunnel resources and never requires `OPENAI_ADMIN_KEY`. Keep the key in your local runtime environment, not command arguments or project files.
 
-For Linux or Windows installation, see the relevant official documentation above.
+For Linux or Windows, see the [official OpenAI `tunnel-client` repository](https://github.com/openai/tunnel-client). No tunnel dependency is needed for local-only development.
 
 ### 4. First setup
 
@@ -80,57 +73,65 @@ To use only the local Bridge:
 c2c setup --no-tunnel
 ```
 
-`setup` starts the Bridge and, when a public tunnel is enabled, prints the connection and pairing information for the ChatGPT Connector. `setup --no-tunnel` starts only the local Bridge for development or local testing; it does not provide a public endpoint for a remote ChatGPT Connector.
+`setup` registers the current workspace, starts the installation Bridge and selected connection, and prints the MCP URL. In ChatGPT, create one connector with **Connection = Tunnel** and **Authentication = No authentication**. Secure Tunnel does not use pairing codes; its local MCP binding is still protected by a process-scoped bearer.
 
-## Tunnel choices
+Missing credentials or `tunnel-client` produce an error, never an automatic Pairing fallback. `setup --no-tunnel` starts only the local Bridge for development; it does not provide a remote ChatGPT endpoint. Neither setup mode generates a pairing code.
 
-### Cloudflare Quick
+## Connection profiles
 
-```bash
-brew install cloudflared
-c2c tunnel choose --mode quick
-```
+| Profile | Transport | ChatGPT authentication | Selection |
+| --- | --- | --- | --- |
+| Secure Tunnel | Official OpenAI `tunnel-client` | No authentication (C2C's local bearer is internal) | Default for unconfigured installations |
+| Pairing | Cloudflare Quick or Named Tunnel | OAuth + one-time pairing code | Explicit `c2c connection use pairing` |
 
-Fastest to start; the public URL may change after a restart.
-
-### Cloudflare Named
+To use the older Pairing flow:
 
 ```bash
 brew install cloudflared
-c2c tunnel choose --mode named --zone example.com
+c2c connection use pairing
+c2c setup
+# Create the ChatGPT connector using the printed HTTPS MCP URL and OAuth.
+# Only when ChatGPT opens the authorization form:
+c2c pair
 ```
 
-Needs a Cloudflare account and a domain already added to Cloudflare.
-
-### OpenAI Secure Tunnel
+Quick URLs may change after a restart. For a stable Cloudflare hostname, explicitly choose:
 
 ```bash
-brew install openai/tools/tunnel-client
-export CONTROL_PLANE_TUNNEL_ID=tunnel_...
-export CONTROL_PLANE_API_KEY=...
-c2c tunnel choose --mode openai
+c2c connection use pairing --transport named --zone example.com
+c2c setup
 ```
 
-This uses an existing OpenAI Tunnel and the official `tunnel-client`. The Runtime API Key is used only at runtime, `OPENAI_ADMIN_KEY` is not required, and C2C does not create or delete Tunnel resources. Start the public connection with `c2c start --tunnel` when needed.
+Named transport needs a Cloudflare account and a domain already managed there. Failed provisioning leaves the existing profile unchanged; it does not silently switch to Quick. See the [Cloudflare installation documentation](https://developers.cloudflare.com/tunnel/downloads/).
+
+To return to Secure Tunnel after preparing its runtime configuration:
+
+```bash
+c2c connection use secure
+c2c setup
+```
+
+Changing profiles stops the existing owned Bridge when necessary. Run setup/start afterwards and update the ChatGPT connector's URL and authentication settings. Adding a workspace does **not** switch profiles or recreate the connector.
 
 ## CLI: what do I want to do?
 
 ### I want to start the current project
 
 ```bash
-c2c start --tunnel
+c2c start
 c2c status
 ```
 
-Use `c2c start` without `--tunnel` for a local-only Bridge. Use `c2c setup` the first time when you also need pairing instructions.
+`start` and `restart` establish the selected connection by default. Use `--no-tunnel` for a local-only development Bridge. `setup` also prints initial connector instructions.
 
 ### I want to add another repository or worktree
 
-Run this from any directory; the path and alias are explicit:
+Use a positional path, or omit it to register the current directory:
 
 ```bash
-c2c workspace add --workspace /path/to/repository --alias main
-c2c workspace add --workspace /path/to/worktree --alias review
+c2c workspace add
+c2c workspace add /path/to/repository --alias main
+c2c workspace add /path/to/worktree --alias review
 c2c workspace list
 ```
 
@@ -156,16 +157,27 @@ c2c restart  # replace the installation daemon
 c2c stop     # stop the installation daemon
 ```
 
-### I want to choose a tunnel
+### I want to inspect or switch connection profiles
 
 ```bash
-c2c tunnel status
-c2c tunnel choose --mode quick
-c2c tunnel choose --mode named --zone example.com
-c2c tunnel choose --mode openai
+c2c connection status
+c2c connection use secure
+c2c connection use pairing
 ```
 
-OpenAI selection validates the Tunnel ID, Runtime API Key, and official client before taking down a healthy existing daemon. Named-tunnel provisioning is completed before the installation state is changed; a failed candidate does not unnecessarily remove the current connection.
+Secure selection validates the Tunnel ID, Runtime API Key, and client before changing a healthy installation. `pair` and `unpair` only work in Pairing mode; `unpair` revokes OAuth access for **all** registered workspaces. Use `c2c stop` to stop a Secure connection; upstream Tunnel access is managed outside C2C.
+
+### I want to set the CLI language
+
+```bash
+c2c prefs set --language en       # default, regardless of OS locale
+c2c prefs set --language zh-TW    # explicit Traditional Chinese
+c2c prefs --json
+```
+
+Language is installation-wide. JSON keys, profile names, and error codes stay stable; human-facing messages use the selected language. User content and third-party diagnostics are not translated.
+
+Existing persisted `quick`, `named`, and `openai` choices are retained. Legacy `tunnel choose --mode openai|quick|named`, `workspace register`, `workspace default`, and `workspace add -w <path>` remain accepted but hidden from the main help. Installation-wide commands accept and ignore leftover `-w`; workspace-specific commands still use it to select a local root. Do not combine a positional add path with `-w`.
 
 ## Multi-workspace model
 
@@ -186,7 +198,7 @@ one C2C Connector / MCP endpoint
 ## Lifecycle and safety
 
 - An installation has one daemon and one installation-owned tunnel.
-- `start` and diagnostics reuse an ownership-verified daemon with the same runtime contract, even when its build differs.
+- Local-only startup can reuse an ownership-verified, same-contract older daemon. Public startup and repair require the selected profile and current build; otherwise C2C asks for an explicit `restart`.
 - An explicit `restart` upgrades that daemon only after ownership and admin authority are verified; a contract mismatch still fails closed.
 - An unverifiable PID, reused PID, corrupt lock, or unknown owner is never killed directly.
 - Corrupt or unsupported canonical state fails closed.
@@ -213,6 +225,8 @@ pnpm typecheck
 pnpm build
 pnpm test
 ```
+
+CLI flow diagram: [`docs/cli-workflows.html`](docs/cli-workflows.html).
 
 More detail: [`docs/architecture.md`](docs/architecture.md), [`docs/multi-workspace.md`](docs/multi-workspace.md), [`docs/security.md`](docs/security.md), and [`docs/troubleshooting.md`](docs/troubleshooting.md).
 
