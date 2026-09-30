@@ -1,3 +1,5 @@
+[English](README.md) | [繁體中文摘要](README.zh-TW.md)
+
 # C2C Multi-Workspace
 
 C2C is a CLI for connecting ChatGPT to registered local workspaces through a read-only MCP Bridge. ChatGPT plans and reviews; your coding agent retains editing, shell, git, and test execution.
@@ -55,7 +57,12 @@ export CONTROL_PLANE_TUNNEL_ID=tunnel_...
 export CONTROL_PLANE_API_KEY=...
 ```
 
-Obtain an existing Tunnel ID and Runtime API Key outside C2C. C2C runs the official client but does not create/delete Tunnel resources and never requires `OPENAI_ADMIN_KEY`. Keep the key in your local runtime environment, not command arguments or project files.
+Prepare the credentials outside C2C:
+
+1. Create or select a Tunnel in [OpenAI API Tunnels](https://platform.openai.com/settings/organization/tunnels), then set its ID as `CONTROL_PLANE_TUNNEL_ID`.
+2. Create or select a runtime key in [OpenAI API keys](https://platform.openai.com/settings/organization/api-keys), then set it as `CONTROL_PLANE_API_KEY`.
+
+C2C runs the official client but does not create/delete Tunnel resources and never requires `OPENAI_ADMIN_KEY`. Keep the key in your local runtime environment, not command arguments or project files.
 
 For Linux or Windows, see the [official OpenAI `tunnel-client` repository](https://github.com/openai/tunnel-client). No tunnel dependency is needed for local-only development.
 
